@@ -1,7 +1,7 @@
 {
   "name": "noria-engine",
   "version": "1.0.0",
-  "description": "NORIA - SkyGlobe standalone AI intelligence engine",
+  "description": "NORIA — SkyGlobe's standalone AI intelligence engine (3-layer RAG: LLM + pgvector + web grounding)",
   "type": "module",
   "main": "server.js",
   "scripts": {

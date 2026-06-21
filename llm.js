@@ -1,132 +1,98 @@
 /**
- * NORIA API Server — standalone AI intelligence engine.
+ * NORIA LLM Layer — model abstraction so the provider can be swapped.
  *
- * Endpoints:
- *   GET  /health             — liveness probe
- *   POST /v1/ask             — main NORIA query endpoint
- *   POST /v1/ingest          — add knowledge (admin, requires NORIA_SETUP_SECRET)
- *   POST /v1/setup           — create schema + seed (admin, requires NORIA_SETUP_SECRET)
+ * Priority chain (all free or cheapest-available):
+ *   1. Groq  (llama-3.3-70b-versatile) — free tier, fast
+ *   2. Gemini (gemini-2.0-flash)        — free tier
+ *   3. Ollama (llama3)                  — local, 100% free
  *
- * Any SkyGlobe product (immigration site, future health/finance apps, etc.)
- * calls this single service over HTTP. One brain, many products.
+ * At least one must be configured for NORIA to answer.
  */
 
-import 'dotenv/config'
-import express from 'express'
-import cors from 'cors'
-import { ask } from './engine.js'
-import { ingestText } from './ingest.js'
-import { setupSchema } from './vectorstore.js'
-import { seedKnowledge } from './ingest.js'
-import { activeProvider } from './llm.js'
+async function groqComplete(messages, opts = {}) {
+  const key = process.env.GROQ_API_KEY
+  if (!key) throw new Error('GROQ_API_KEY not set')
 
-const app = express()
-app.use(express.json({ limit: '1mb' }))
-
-// CORS — restrict to your SkyGlobe domains in production via ALLOWED_ORIGINS
-const allowed = (process.env.ALLOWED_ORIGINS || '*').split(',').map((s) => s.trim())
-app.use(
-  cors({
-    origin: allowed.includes('*') ? true : allowed,
-    methods: ['GET', 'POST'],
+  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+    body: JSON.stringify({
+      model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+      messages,
+      max_tokens: opts.maxTokens ?? 1200,
+      temperature: opts.temperature ?? 0.4,
+      stream: false,
+    }),
   })
-)
-
-// ── Simple per-IP rate limiter (in-memory) ────────────────────────────────────
-const hits = new Map()
-const WINDOW_MS = 60_000
-const MAX_PER_WINDOW = 30
-app.use((req, res, next) => {
-  if (req.path === '/health') return next()
-  const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown'
-  const now = Date.now()
-  const rec = hits.get(ip) || { count: 0, reset: now + WINDOW_MS }
-  if (now > rec.reset) {
-    rec.count = 0
-    rec.reset = now + WINDOW_MS
-  }
-  rec.count++
-  hits.set(ip, rec)
-  if (rec.count > MAX_PER_WINDOW) return res.status(429).json({ error: 'Too many requests. Please slow down.' })
-  next()
-})
-
-function requireSecret(req, res) {
-  const secret = process.env.NORIA_SETUP_SECRET
-  if (!secret) return true // no secret configured → allow (dev only)
-  if (req.headers.authorization !== `Bearer ${secret}`) {
-    res.status(401).json({ error: 'Unauthorized' })
-    return false
-  }
-  return true
+  if (!res.ok) throw new Error(`Groq error ${res.status}: ${await res.text()}`)
+  const data = await res.json()
+  return data.choices?.[0]?.message?.content ?? ''
 }
 
-// ── Health ────────────────────────────────────────────────────────────────────
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'noria-engine',
-    provider: activeProvider(),
-    db: !!process.env.DATABASE_URL,
-    time: new Date().toISOString(),
+async function geminiComplete(messages, opts = {}) {
+  const key = process.env.GEMINI_API_KEY
+  if (!key) throw new Error('GEMINI_API_KEY not set')
+
+  const system = messages.find((m) => m.role === 'system')?.content ?? ''
+  const contents = messages
+    .filter((m) => m.role !== 'system')
+    .map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }))
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        system_instruction: system ? { parts: [{ text: system }] } : undefined,
+        contents,
+        generationConfig: { maxOutputTokens: opts.maxTokens ?? 1200, temperature: opts.temperature ?? 0.4 },
+      }),
+    }
+  )
+  if (!res.ok) throw new Error(`Gemini error ${res.status}: ${await res.text()}`)
+  const data = await res.json()
+  return data.candidates?.[0]?.content?.parts?.[0]?.text ?? ''
+}
+
+async function ollamaComplete(messages, opts = {}) {
+  const base = process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434'
+  const model = process.env.OLLAMA_MODEL ?? 'llama3'
+
+  const res = await fetch(`${base}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, messages, stream: false, options: { num_predict: opts.maxTokens ?? 1200 } }),
   })
-})
+  if (!res.ok) throw new Error(`Ollama error ${res.status}`)
+  const data = await res.json()
+  return data.message?.content ?? ''
+}
 
-// ── Main query endpoint ─────────────────────────────────────────────────────
-app.post('/v1/ask', async (req, res) => {
-  try {
-    const query = String(req.body?.query ?? req.body?.message ?? '').trim()
-    if (!query) return res.status(400).json({ error: 'query is required' })
-    if (query.length > 2000) return res.status(400).json({ error: 'query too long (max 2000 chars)' })
+export async function complete(messages, opts = {}) {
+  const providers = []
+  if (process.env.GROQ_API_KEY) providers.push(() => groqComplete(messages, opts))
+  if (process.env.GEMINI_API_KEY) providers.push(() => geminiComplete(messages, opts))
+  if (process.env.OLLAMA_BASE_URL || process.env.OLLAMA_MODEL) providers.push(() => ollamaComplete(messages, opts))
 
-    const rawHistory = Array.isArray(req.body?.history) ? req.body.history.slice(-10) : []
-    const history = rawHistory
-      .filter((m) => m.role === 'user' || m.role === 'assistant')
-      .map((m) => ({ role: m.role, content: String(m.content) }))
+  if (providers.length === 0)
+    throw new Error('No LLM provider configured. Set GROQ_API_KEY, GEMINI_API_KEY, or OLLAMA_BASE_URL.')
 
-    const result = await ask(query, history)
-    res.json(result)
-  } catch (e) {
-    console.error('/v1/ask error:', e)
-    res.json({
-      answer:
-        'NORIA is temporarily unavailable. Please try again shortly or contact support@skyglobegroup.com.',
-      sources: [],
-    })
+  let lastErr = null
+  for (const provider of providers) {
+    try {
+      const text = await provider()
+      if (text?.trim()) return text.trim()
+    } catch (e) {
+      lastErr = e
+    }
   }
-})
+  throw lastErr ?? new Error('All LLM providers failed.')
+}
 
-// ── Admin: ingest knowledge ──────────────────────────────────────────────────
-app.post('/v1/ingest', async (req, res) => {
-  if (!requireSecret(req, res)) return
-  if (!process.env.DATABASE_URL) return res.status(503).json({ error: 'DATABASE_URL not configured' })
-  try {
-    const source = String(req.body?.source ?? '').trim()
-    const content = String(req.body?.content ?? '').trim()
-    if (!source || !content) return res.status(400).json({ error: 'source and content are required' })
-    const chunks = await ingestText(source, content, req.body?.metadata ?? {})
-    res.json({ ok: true, source, chunks })
-  } catch (e) {
-    console.error('/v1/ingest error:', e)
-    res.status(500).json({ error: e.message })
-  }
-})
-
-// ── Admin: setup schema + seed ───────────────────────────────────────────────
-app.post('/v1/setup', async (req, res) => {
-  if (!requireSecret(req, res)) return
-  if (!process.env.DATABASE_URL) return res.status(503).json({ error: 'DATABASE_URL not configured' })
-  try {
-    await setupSchema()
-    await seedKnowledge()
-    res.json({ ok: true, message: 'NORIA schema created and seed knowledge ingested.' })
-  } catch (e) {
-    console.error('/v1/setup error:', e)
-    res.status(500).json({ error: e.message })
-  }
-})
-
-const PORT = process.env.PORT || 4000
-app.listen(PORT, () => {
-  console.log(`NORIA engine listening on :${PORT} — provider=${activeProvider()} db=${!!process.env.DATABASE_URL}`)
-})
+export function activeProvider() {
+  if (process.env.GROQ_API_KEY) return 'groq'
+  if (process.env.GEMINI_API_KEY) return 'gemini'
+  if (process.env.OLLAMA_BASE_URL || process.env.OLLAMA_MODEL) return 'ollama'
+  return 'none'
+}

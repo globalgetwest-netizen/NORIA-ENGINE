@@ -1,65 +1,62 @@
 /**
- * NORIA Vector Store — PostgreSQL + pgvector.
- * Uses DATABASE_URL. No extra vendor, no subscription.
+ * NORIA Ingest Pipeline — chunk → embed → store in pgvector.
  */
 
-import pg from 'pg'
-import { EMBEDDING_DIM } from './embedder.js'
+import { embed, chunkText } from './embedder.js'
+import { upsertDocument, setupSchema } from './vectorstore.js'
 
-const { Pool } = pg
-let _pool = null
-
-function getPool() {
-  if (_pool) return _pool
-  _pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: /render\.com|amazonaws\.com|supabase/.test(process.env.DATABASE_URL || '')
-      ? { rejectUnauthorized: false }
-      : false,
-  })
-  return _pool
+export async function ingestText(source, text, metadata = {}) {
+  await setupSchema()
+  const chunks = chunkText(text)
+  let count = 0
+  for (const chunk of chunks) {
+    const vec = await embed(chunk)
+    await upsertDocument(source, chunk, vec, metadata)
+    count++
+  }
+  return count
 }
 
-export async function setupSchema() {
-  const pool = getPool()
-  await pool.query(`CREATE EXTENSION IF NOT EXISTS vector`)
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS noria_documents (
-      id         BIGSERIAL PRIMARY KEY,
-      source     TEXT NOT NULL,
-      content    TEXT NOT NULL,
-      embedding  vector(${EMBEDDING_DIM}),
-      metadata   JSONB DEFAULT '{}',
-      created_at TIMESTAMPTZ DEFAULT now()
-    )
-  `)
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS noria_docs_embedding_idx
-      ON noria_documents USING ivfflat (embedding vector_cosine_ops)
-      WITH (lists = 100)
-  `)
+export async function ingestDocuments(docs) {
+  await setupSchema()
+  const results = []
+  for (const doc of docs) {
+    const chunks = await ingestText(doc.source, doc.content, doc.metadata ?? {})
+    results.push({ source: doc.source, chunks })
+  }
+  return results
 }
 
-export async function upsertDocument(source, content, embedding, metadata = {}) {
-  const pool = getPool()
-  const vec = `[${embedding.join(',')}]`
-  await pool.query(
-    `INSERT INTO noria_documents (source, content, embedding, metadata)
-     VALUES ($1, $2, $3::vector, $4)`,
-    [source, content, vec, JSON.stringify(metadata)]
-  )
-}
+export const SKYGLOBE_SEED = [
+  {
+    source: 'skyglobe-overview',
+    content: `SkyGlobe Group Limited is a global mobility and immigration consultancy headquartered in London, with offices in Lagos and Dubai. We help individuals and organisations navigate international movement — from study and work to residency and beyond. We have handled over 5,000 cases across 47 countries with a 98% success rate and 10+ years of experience. Our services include: Study Abroad (UK, USA, Canada, Australia, Germany), Work Permits, Visit Visas, EU Employment matching, Immigration Support, Conferences & Events, and Business Setup. Contact: info@skyglobegroup.com | +1 (800) SKYGLOBE`,
+  },
+  {
+    source: 'skyglobe-services-study',
+    content: `SkyGlobe Study Abroad service covers: UK Student Route visa, USA F-1 student visa, Canada Study Permit, Australia Subclass 500, Germany student visa. We handle university applications, scholarship searches (we have secured $2M+ in scholarships), financial proof preparation, and interview preparation. Typical processing: 4–12 weeks depending on destination. Requirements: valid passport, acceptance letter, financial evidence, language test scores (IELTS/TOEFL).`,
+  },
+  {
+    source: 'skyglobe-services-work',
+    content: `SkyGlobe Work Permit services: UK Skilled Worker visa, Canada Express Entry, Germany Job Seeker visa, EU Blue Card, UAE work permit. We assist with employer sponsorship, credential recognition, job matching through our EU Employment programme, and document legalisation. The EU Employment programme connects skilled African professionals with vetted employers across EU member states.`,
+  },
+  {
+    source: 'skyglobe-services-visit',
+    content: `SkyGlobe Visit Visa service covers tourism, family visits, and business travel visas for Schengen, UK, USA, Canada, UAE, and Australia. We prepare your application pack, cover letters, financial statements, and handle submission. Typical success rate: 95%+ with proper documentation.`,
+  },
+  {
+    source: 'skyglobe-pricing',
+    content: `SkyGlobe pricing plans: Starter ($299) — 1 visa application, NORIA AI guidance, document checklist, email support, case tracking. Professional ($699) — 3 visa applications, priority NORIA access, document review, priority support, EU Employment matching, monthly consultations. Enterprise (Custom) — unlimited applications, dedicated case manager, API access, SLA guarantee, staff portal. All prices exclude government visa fees.`,
+  },
+  {
+    source: 'noria-identity',
+    content: `NORIA is SkyGlobe's AI intelligence engine — Neural Optimized Research and Intelligence Assistant. NORIA provides instant answers on visas, universities, work permits, and global opportunities. NORIA can analyse documents for completeness and provide personalised step-by-step guidance. NORIA is trained on comprehensive immigration law, visa policy, scholarship databases, and global mobility data. For complex cases, NORIA recommends speaking with a SkyGlobe human expert.`,
+  },
+]
 
-export async function similaritySearch(embedding, topK = 5) {
-  const pool = getPool()
-  const vec = `[${embedding.join(',')}]`
-  const { rows } = await pool.query(
-    `SELECT id, source, content, metadata,
-            1 - (embedding <=> $1::vector) AS similarity
-     FROM noria_documents
-     ORDER BY embedding <=> $1::vector
-     LIMIT $2`,
-    [vec, topK]
-  )
-  return rows
+export async function seedKnowledge() {
+  console.log('NORIA: seeding baseline knowledge...')
+  const results = await ingestDocuments(SKYGLOBE_SEED)
+  for (const r of results) console.log(`  ✓ ${r.source}: ${r.chunks} chunks`)
+  console.log('NORIA: seed complete.')
 }
