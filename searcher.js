@@ -1,7 +1,8 @@
 /**
  * NORIA Web Search Grounding — live internet lookup for real-time data.
- *   1. Brave Search API (free 2,000/month)
- *   2. DuckDuckGo Instant Answers (free, no key)
+ *   1. Tavily AI Search (1,000 free/month — best for AI)
+ *   2. Brave Search API (paid)
+ *   3. DuckDuckGo Instant Answers (free, no key, fallback)
  */
 
 const NEEDS_LIVE_RE =
@@ -9,6 +10,29 @@ const NEEDS_LIVE_RE =
 
 export function needsLiveSearch(query) {
   return NEEDS_LIVE_RE.test(query)
+}
+
+async function tavilySearch(query) {
+  const key = process.env.TAVILY_API_KEY
+  if (!key) throw new Error('TAVILY_API_KEY not set')
+  const res = await fetch('https://api.tavily.com/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      api_key: key,
+      query,
+      search_depth: 'basic',
+      max_results: 5,
+      include_answer: false,
+    }),
+  })
+  if (!res.ok) throw new Error(`Tavily search error ${res.status}`)
+  const data = await res.json()
+  return (data.results ?? []).slice(0, 5).map((r) => ({
+    title: r.title,
+    url: r.url,
+    snippet: r.content ?? '',
+  }))
 }
 
 async function braveSearch(query) {
@@ -42,10 +66,11 @@ async function duckduckgoSearch(query) {
 }
 
 export async function webSearch(query) {
+  if (process.env.TAVILY_API_KEY) {
+    try { return await tavilySearch(query) } catch (_) {}
+  }
   if (process.env.BRAVE_SEARCH_API_KEY) {
-    try {
-      return await braveSearch(query)
-    } catch (_) {}
+    try { return await braveSearch(query) } catch (_) {}
   }
   return duckduckgoSearch(query)
 }
