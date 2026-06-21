@@ -5,7 +5,7 @@
  */
 
 const NEEDS_LIVE_RE =
-  /conference|event|news|current|latest|today|2024|2025|2026|deadline|price|rate|opening|scholarship|application|embassy|appointment/i
+  /conference|event|news|current|latest|today|2024|2025|2026|deadline|price|rate|opening|scholarship|application|embassy|appointment|election|coup|war|attack|crisis|conflict|protest|flood|earthquake|hurricane|pandemic|vaccine|sanction|policy|law|bill|summit|treaty|agreement|stock|market|currency|inflation|gdp|budget|president|prime minister|government|minister|arrest|killed|died|death|born|won|lost|signed|launched|announced|released|discovered/i
 
 export function needsLiveSearch(query) {
   return NEEDS_LIVE_RE.test(query)
