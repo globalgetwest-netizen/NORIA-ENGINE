@@ -1,8 +1,9 @@
 /**
- * NORIA Web Search Grounding — live internet lookup for real-time data.
- *   1. Tavily AI Search (1,000 free/month — best for AI)
- *   2. Brave Search API (paid)
- *   3. DuckDuckGo Instant Answers (free, no key, fallback)
+ * NORIA Web Search Grounding — 4-layer search stack, never empty.
+ *   1. Tavily AI Search     (1,000 free/month — best for AI)
+ *   2. Serper.dev           (2,500 free searches)
+ *   3. Google Custom Search (100 free/day = 3,000/month)
+ *   4. DuckDuckGo           (unlimited free fallback, no key needed)
  */
 
 const NEEDS_LIVE_RE =
@@ -18,37 +19,35 @@ async function tavilySearch(query) {
   const res = await fetch('https://api.tavily.com/search', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      api_key: key,
-      query,
-      search_depth: 'basic',
-      max_results: 5,
-      include_answer: false,
-    }),
+    body: JSON.stringify({ api_key: key, query, search_depth: 'basic', max_results: 5 }),
   })
-  if (!res.ok) throw new Error(`Tavily search error ${res.status}`)
+  if (!res.ok) throw new Error(`Tavily error ${res.status}`)
   const data = await res.json()
-  return (data.results ?? []).slice(0, 5).map((r) => ({
-    title: r.title,
-    url: r.url,
-    snippet: r.content ?? '',
-  }))
+  return (data.results ?? []).slice(0, 5).map((r) => ({ title: r.title, url: r.url, snippet: r.content ?? '' }))
 }
 
-async function braveSearch(query) {
-  const key = process.env.BRAVE_SEARCH_API_KEY
-  if (!key) throw new Error('BRAVE_SEARCH_API_KEY not set')
-  const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5`
-  const res = await fetch(url, {
-    headers: { Accept: 'application/json', 'Accept-Encoding': 'gzip', 'X-Subscription-Token': key },
+async function serperSearch(query) {
+  const key = process.env.SERPER_API_KEY
+  if (!key) throw new Error('SERPER_API_KEY not set')
+  const res = await fetch('https://google.serper.dev/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-KEY': key },
+    body: JSON.stringify({ q: query, num: 5 }),
   })
-  if (!res.ok) throw new Error(`Brave search error ${res.status}`)
+  if (!res.ok) throw new Error(`Serper error ${res.status}`)
   const data = await res.json()
-  return (data.web?.results ?? []).slice(0, 5).map((r) => ({
-    title: r.title,
-    url: r.url,
-    snippet: r.description ?? '',
-  }))
+  return (data.organic ?? []).slice(0, 5).map((r) => ({ title: r.title, url: r.link, snippet: r.snippet ?? '' }))
+}
+
+async function googleSearch(query) {
+  const key = process.env.GOOGLE_SEARCH_KEY
+  const cx = process.env.GOOGLE_SEARCH_CX
+  if (!key || !cx) throw new Error('GOOGLE_SEARCH_KEY or GOOGLE_SEARCH_CX not set')
+  const url = `https://www.googleapis.com/customsearch/v1?key=${key}&cx=${cx}&q=${encodeURIComponent(query)}&num=5`
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`Google search error ${res.status}`)
+  const data = await res.json()
+  return (data.items ?? []).slice(0, 5).map((r) => ({ title: r.title, url: r.link, snippet: r.snippet ?? '' }))
 }
 
 async function duckduckgoSearch(query) {
@@ -67,10 +66,13 @@ async function duckduckgoSearch(query) {
 
 export async function webSearch(query) {
   if (process.env.TAVILY_API_KEY) {
-    try { return await tavilySearch(query) } catch (_) {}
+    try { const r = await tavilySearch(query); if (r.length) return r } catch (_) {}
   }
-  if (process.env.BRAVE_SEARCH_API_KEY) {
-    try { return await braveSearch(query) } catch (_) {}
+  if (process.env.SERPER_API_KEY) {
+    try { const r = await serperSearch(query); if (r.length) return r } catch (_) {}
+  }
+  if (process.env.GOOGLE_SEARCH_KEY && process.env.GOOGLE_SEARCH_CX) {
+    try { const r = await googleSearch(query); if (r.length) return r } catch (_) {}
   }
   return duckduckgoSearch(query)
 }
