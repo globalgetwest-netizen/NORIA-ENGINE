@@ -1,9 +1,10 @@
 /**
- * NORIA Web Search Grounding — 4-layer search stack, never empty.
+ * NORIA Web Search Grounding — 5-layer search stack, never empty.
  *   1. Tavily AI Search     (1,000 free/month — best for AI)
  *   2. Serper.dev           (2,500 free searches)
  *   3. Google Custom Search (100 free/day = 3,000/month)
- *   4. DuckDuckGo           (unlimited free fallback, no key needed)
+ *   4. You.com Search API   (1,000 free/month)
+ *   5. DuckDuckGo           (unlimited free fallback, no key needed)
  */
 
 const NEEDS_LIVE_RE =
@@ -50,6 +51,22 @@ async function googleSearch(query) {
   return (data.items ?? []).slice(0, 5).map((r) => ({ title: r.title, url: r.link, snippet: r.snippet ?? '' }))
 }
 
+async function youSearch(query) {
+  const key = process.env.YOU_API_KEY
+  if (!key) throw new Error('YOU_API_KEY not set')
+  const url = `https://api.you.com/search?query=${encodeURIComponent(query)}&num_web_results=5`
+  const res = await fetch(url, {
+    headers: { 'X-API-Key': key },
+  })
+  if (!res.ok) throw new Error(`You.com search error ${res.status}`)
+  const data = await res.json()
+  return (data.hits ?? data.web_results ?? []).slice(0, 5).map((r) => ({
+    title: r.title ?? r.name ?? '',
+    url: r.url ?? r.link ?? '',
+    snippet: r.description ?? r.snippet ?? '',
+  }))
+}
+
 async function duckduckgoSearch(query) {
   const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`
   const res = await fetch(url, { headers: { 'User-Agent': 'NORIA/1.0 (SkyGlobe AI assistant)' } })
@@ -73,6 +90,9 @@ export async function webSearch(query) {
   }
   if (process.env.GOOGLE_SEARCH_KEY && process.env.GOOGLE_SEARCH_CX) {
     try { const r = await googleSearch(query); if (r.length) return r } catch (_) {}
+  }
+  if (process.env.YOU_API_KEY) {
+    try { const r = await youSearch(query); if (r.length) return r } catch (_) {}
   }
   return duckduckgoSearch(query)
 }
