@@ -72,25 +72,39 @@ async function ollamaComplete(messages, opts = {}) {
 
 export async function complete(messages, opts = {}) {
   const providers = []
-  if (process.env.GROQ_API_KEY) providers.push(() => groqComplete(messages, opts))
-  if (process.env.GEMINI_API_KEY) providers.push(() => geminiComplete(messages, opts))
-  if (process.env.OLLAMA_BASE_URL || process.env.OLLAMA_MODEL) providers.push(() => ollamaComplete(messages, opts))
+  if (process.env.GROQ_API_KEY) providers.push({ name: 'groq', fn: () => groqComplete(messages, opts) })
+  // Gemini is included only if explicitly enabled — the free tier on many
+  // projects has quota 0 for generateContent, which would only add latency.
+  if (process.env.GEMINI_API_KEY && process.env.GEMINI_ENABLED === 'true')
+    providers.push({ name: 'gemini', fn: () => geminiComplete(messages, opts) })
+  if (process.env.OLLAMA_BASE_URL || process.env.OLLAMA_MODEL)
+    providers.push({ name: 'ollama', fn: () => ollamaComplete(messages, opts) })
 
   if (providers.length === 0)
     throw new Error('No LLM provider configured. Set GROQ_API_KEY, GEMINI_API_KEY, or OLLAMA_BASE_URL.')
 
-  let lastErr = null
-  for (const provider of providers) {
-    try {
-      const text = await provider()
-      if (text?.trim()) return text.trim()
-      console.warn('LLM provider returned empty response, trying next...')
-    } catch (e) {
-      console.warn('LLM provider failed:', e.message)
-      lastErr = e
+  const errors = []
+  for (const { name, fn } of providers) {
+    // Retry once on a transient 429 (rate limit) after a short wait.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const text = await fn()
+        if (text?.trim()) return text.trim()
+        errors.push(`${name}: empty response`)
+        break
+      } catch (e) {
+        const msg = `${name}: ${e.message}`
+        console.warn('LLM provider failed:', msg)
+        if (attempt === 0 && /\b429\b|rate.?limit|RESOURCE_EXHAUSTED/i.test(e.message)) {
+          await new Promise((r) => setTimeout(r, 2500))
+          continue // retry same provider once
+        }
+        errors.push(msg)
+        break
+      }
     }
   }
-  throw lastErr ?? new Error('All LLM providers failed.')
+  throw new Error('All LLM providers failed → ' + errors.join(' | '))
 }
 
 export function activeProvider() {
