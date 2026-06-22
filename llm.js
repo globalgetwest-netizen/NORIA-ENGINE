@@ -1,24 +1,52 @@
 /**
- * NORIA LLM Layer — model abstraction so the provider can be swapped.
+ * NORIA LLM Layer — model abstraction with multi-key rotation.
  *
- * Priority chain (all free or cheapest-available):
- *   1. Groq  (llama-3.3-70b-versatile) — free tier, fast
- *   2. Gemini (gemini-2.0-flash)        — free tier
- *   3. Ollama (llama3)                  — local, 100% free
+ * Provider chain (all free tier):
+ *   1. Groq     (llama-3.3-70b-versatile → llama-3.1-8b-instant fallback)
+ *   2. Cerebras (llama-3.3-70b → llama3.1-8b fallback) — 1M tokens/day free
+ *   3. Gemini   (only if GEMINI_ENABLED=true — most free projects have quota 0)
+ *   4. Ollama   (local, 100% free)
  *
- * At least one must be configured for NORIA to answer.
+ * MULTI-KEY ROTATION
+ * ──────────────────
+ * Supply multiple keys to multiply your daily free capacity at $0:
+ *   GROQ_API_KEYS     = key1,key2,key3      (comma-separated)
+ *   CEREBRAS_API_KEYS = keyA,keyB
+ * The singular GROQ_API_KEY / CEREBRAS_API_KEY are also honoured.
+ *
+ * Keys are tried round-robin (load spreads evenly), and when one hits its
+ * daily/minute token limit NORIA automatically advances to the next key,
+ * then the next provider — so it effectively never goes down.
  */
 
-async function groqComplete(messages, opts = {}) {
-  const key = process.env.GROQ_API_KEY
-  if (!key) throw new Error('GROQ_API_KEY not set')
+// ── Key parsing ────────────────────────────────────────────────────────────────
+function parseKeys(...envNames) {
+  const keys = []
+  for (const name of envNames) {
+    const v = process.env[name]
+    if (v) for (const k of v.split(',').map((s) => s.trim()).filter(Boolean)) if (!keys.includes(k)) keys.push(k)
+  }
+  return keys
+}
 
-  // Primary model (high quality, 100K TPD), fallback to fast model (500K TPD)
-  const primaryModel = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile'
-  const fallbackModel = process.env.GROQ_FALLBACK_MODEL || 'llama-3.1-8b-instant'
+const GROQ_KEYS = parseKeys('GROQ_API_KEYS', 'GROQ_API_KEY')
+const CEREBRAS_KEYS = parseKeys('CEREBRAS_API_KEYS', 'CEREBRAS_API_KEY')
 
-  for (const model of [primaryModel, fallbackModel]) {
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+// Round-robin cursor so load spreads across keys instead of always hammering #1.
+let rotation = 0
+function rotate(arr) {
+  if (arr.length <= 1) return arr
+  const start = rotation++ % arr.length
+  return [...arr.slice(start), ...arr.slice(0, start)]
+}
+
+const isTokenLimit = (s) => /tokens per day|TPD|tokens per minute|TPM|rate.?limit|RESOURCE_EXHAUSTED|\b429\b/i.test(s)
+
+// ── OpenAI-compatible completion (Groq + Cerebras share this shape) ────────────
+async function openAICompatible({ url, key, models, messages, opts }) {
+  let lastErr = ''
+  for (const model of models) {
+    const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
       body: JSON.stringify({
@@ -32,31 +60,43 @@ async function groqComplete(messages, opts = {}) {
     if (res.ok) {
       const data = await res.json()
       const text = data.choices?.[0]?.message?.content ?? ''
-      if (text.trim()) {
-        if (model !== primaryModel) console.warn(`Groq: primary model hit limit, used ${model} instead`)
-        return text.trim()
-      }
-    }
-    const errText = await res.text()
-    // If daily/minute token limit hit, try next model — otherwise throw immediately
-    if (res.status === 429 && /tokens per day|TPD|tokens per minute|TPM/i.test(errText)) {
-      console.warn(`Groq model ${model} hit token limit, trying fallback...`)
+      if (text.trim()) return text.trim()
+      lastErr = `${model}: empty response`
       continue
     }
-    throw new Error(`Groq error ${res.status}: ${errText}`)
+    const errText = await res.text()
+    lastErr = `${model} ${res.status}: ${errText}`
+    // Token-limit → try the next (cheaper/higher-quota) model on this key.
+    if (res.status === 429 && isTokenLimit(errText)) continue
+    // Any other error → stop trying models on this key.
+    throw new Error(lastErr)
   }
-  throw new Error('Groq: all models hit token limits for today')
+  throw new Error(lastErr || 'all models exhausted')
+}
+
+async function groqComplete(key, messages, opts = {}) {
+  const models = [
+    process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+    process.env.GROQ_FALLBACK_MODEL || 'llama-3.1-8b-instant',
+  ]
+  return openAICompatible({ url: 'https://api.groq.com/openai/v1/chat/completions', key, models, messages, opts })
+}
+
+async function cerebrasComplete(key, messages, opts = {}) {
+  const models = [
+    process.env.CEREBRAS_MODEL || 'llama-3.3-70b',
+    process.env.CEREBRAS_FALLBACK_MODEL || 'llama3.1-8b',
+  ]
+  return openAICompatible({ url: 'https://api.cerebras.ai/v1/chat/completions', key, models, messages, opts })
 }
 
 async function geminiComplete(messages, opts = {}) {
   const key = process.env.GEMINI_API_KEY
   if (!key) throw new Error('GEMINI_API_KEY not set')
-
   const system = messages.find((m) => m.role === 'system')?.content ?? ''
   const contents = messages
     .filter((m) => m.role !== 'system')
     .map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }))
-
   const model = process.env.GEMINI_MODEL || 'gemini-2.0-flash-lite'
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
@@ -78,7 +118,6 @@ async function geminiComplete(messages, opts = {}) {
 async function ollamaComplete(messages, opts = {}) {
   const base = process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434'
   const model = process.env.OLLAMA_MODEL ?? 'llama3'
-
   const res = await fetch(`${base}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -90,44 +129,40 @@ async function ollamaComplete(messages, opts = {}) {
 }
 
 export async function complete(messages, opts = {}) {
-  const providers = []
-  if (process.env.GROQ_API_KEY) providers.push({ name: 'groq', fn: () => groqComplete(messages, opts) })
-  // Gemini is included only if explicitly enabled — the free tier on many
-  // projects has quota 0 for generateContent, which would only add latency.
+  // Build the ordered list of attempts: every Groq key, then every Cerebras key,
+  // then optional Gemini, then optional Ollama. Keys are rotated for load spread.
+  const attempts = []
+  for (const key of rotate(GROQ_KEYS))
+    attempts.push({ name: `groq#${GROQ_KEYS.indexOf(key) + 1}`, fn: () => groqComplete(key, messages, opts) })
+  for (const key of rotate(CEREBRAS_KEYS))
+    attempts.push({ name: `cerebras#${CEREBRAS_KEYS.indexOf(key) + 1}`, fn: () => cerebrasComplete(key, messages, opts) })
   if (process.env.GEMINI_API_KEY && process.env.GEMINI_ENABLED === 'true')
-    providers.push({ name: 'gemini', fn: () => geminiComplete(messages, opts) })
+    attempts.push({ name: 'gemini', fn: () => geminiComplete(messages, opts) })
   if (process.env.OLLAMA_BASE_URL || process.env.OLLAMA_MODEL)
-    providers.push({ name: 'ollama', fn: () => ollamaComplete(messages, opts) })
+    attempts.push({ name: 'ollama', fn: () => ollamaComplete(messages, opts) })
 
-  if (providers.length === 0)
-    throw new Error('No LLM provider configured. Set GROQ_API_KEY, GEMINI_API_KEY, or OLLAMA_BASE_URL.')
+  if (attempts.length === 0)
+    throw new Error('No LLM provider configured. Set GROQ_API_KEY(S), CEREBRAS_API_KEY(S), GEMINI_API_KEY, or OLLAMA_BASE_URL.')
 
   const errors = []
-  for (const { name, fn } of providers) {
-    // Retry once on a transient 429 (rate limit) after a short wait.
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const text = await fn()
-        if (text?.trim()) return text.trim()
-        errors.push(`${name}: empty response`)
-        break
-      } catch (e) {
-        const msg = `${name}: ${e.message}`
-        console.warn('LLM provider failed:', msg)
-        if (attempt === 0 && /\b429\b|rate.?limit|RESOURCE_EXHAUSTED/i.test(e.message)) {
-          await new Promise((r) => setTimeout(r, 2500))
-          continue // retry same provider once
-        }
-        errors.push(msg)
-        break
-      }
+  for (const { name, fn } of attempts) {
+    try {
+      const text = await fn()
+      if (text?.trim()) return text.trim()
+      errors.push(`${name}: empty`)
+    } catch (e) {
+      console.warn('LLM attempt failed:', `${name}: ${e.message}`)
+      errors.push(`${name}: ${e.message}`)
+      // On a token limit, move straight to the next key/provider (no wait).
+      // On other errors, also continue to the next attempt.
     }
   }
-  throw new Error('All LLM providers failed → ' + errors.join(' | '))
+  throw new Error('All LLM attempts failed → ' + errors.join(' | '))
 }
 
 export function activeProvider() {
-  if (process.env.GROQ_API_KEY) return 'groq'
+  if (GROQ_KEYS.length) return GROQ_KEYS.length > 1 ? `groq (${GROQ_KEYS.length} keys)` : 'groq'
+  if (CEREBRAS_KEYS.length) return CEREBRAS_KEYS.length > 1 ? `cerebras (${CEREBRAS_KEYS.length} keys)` : 'cerebras'
   if (process.env.GEMINI_API_KEY) return 'gemini'
   if (process.env.OLLAMA_BASE_URL || process.env.OLLAMA_MODEL) return 'ollama'
   return 'none'
