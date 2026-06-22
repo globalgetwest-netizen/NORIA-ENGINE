@@ -61,6 +61,19 @@ function requireSecret(req, res) {
   return true
 }
 
+// ── LLM test (diagnostic only) ────────────────────────────────────────────────
+app.get('/v1/test-llm', async (req, res) => {
+  const secret = process.env.NORIA_SETUP_SECRET
+  if (secret && req.query.secret !== secret) return res.status(401).send('Unauthorized')
+  try {
+    const { complete } = await import('./llm.js')
+    const text = await complete([{ role: 'user', content: 'Say: NORIA LLM OK' }], { maxTokens: 20 })
+    res.json({ ok: true, response: text })
+  } catch (e) {
+    res.json({ ok: false, error: e.message })
+  }
+})
+
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({
