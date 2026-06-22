@@ -57,7 +57,12 @@ async function ollamaEmbed(text) {
 
 export async function embed(text) {
   if (process.env.GEMINI_API_KEY) {
-    try { return await geminiEmbed(text) } catch (e) { console.warn('Gemini embed failed:', e.message) }
+    try {
+      return await geminiEmbed(text)
+    } catch (e) {
+      console.warn('Gemini embed failed:', e.message)
+      throw new Error('Gemini embed failed: ' + e.message)
+    }
   }
   if (process.env.OPENAI_API_KEY) {
     try { return await openaiEmbed(text) } catch (e) { console.warn('OpenAI embed failed:', e.message) }
