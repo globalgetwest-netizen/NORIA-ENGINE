@@ -65,13 +65,31 @@ function requireSecret(req, res) {
 app.get('/v1/test-llm', async (req, res) => {
   const secret = process.env.NORIA_SETUP_SECRET
   if (secret && req.query.secret !== secret) return res.status(401).send('Unauthorized')
+  const results = {}
+  // Test 1: raw LLM
   try {
     const { complete } = await import('./llm.js')
     const text = await complete([{ role: 'user', content: 'Say: NORIA LLM OK' }], { maxTokens: 20 })
-    res.json({ ok: true, response: text })
+    results.llm = { ok: true, response: text }
   } catch (e) {
-    res.json({ ok: false, error: e.message })
+    results.llm = { ok: false, error: e.message }
   }
+  // Test 2: embed
+  try {
+    const { embed } = await import('./embedder.js')
+    const vec = await embed('test')
+    results.embed = { ok: true, dims: vec?.length }
+  } catch (e) {
+    results.embed = { ok: false, error: e.message }
+  }
+  // Test 3: full ask()
+  try {
+    const result = await ask('Hello, are you working?', [])
+    results.ask = { ok: true, answer: result.answer?.slice(0, 200), provider: result.provider }
+  } catch (e) {
+    results.ask = { ok: false, error: e.message }
+  }
+  res.json(results)
 })
 
 // ── Health ────────────────────────────────────────────────────────────────────
