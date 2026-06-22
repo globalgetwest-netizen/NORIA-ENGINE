@@ -184,10 +184,12 @@ export async function ask(query, historyMessages = []) {
 
   let answer = ''
   let provider = activeProvider()
+  let llmError = null
   try {
     answer = await complete(messages, { maxTokens: 1000, temperature: 0.35 })
   } catch (e) {
     console.error('NORIA LLM error:', e.message)
+    llmError = e.message
     answer =
       'NORIA is momentarily unavailable. Please try again in a few seconds, or contact our team at support@skyglobegroup.com.'
     provider = 'fallback'
@@ -209,5 +211,5 @@ export async function ask(query, historyMessages = []) {
     })
   )
 
-  return { answer, sources, retrievedDocs: retrievedDocs.length, webResults: webResults.length, provider }
+  return { answer, sources, retrievedDocs: retrievedDocs.length, webResults: webResults.length, provider, llmError }
 }
