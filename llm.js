@@ -38,7 +38,7 @@ async function geminiComplete(messages, opts = {}) {
     .filter((m) => m.role !== 'system')
     .map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }))
 
-  const model = process.env.GEMINI_MODEL || 'gemini-1.5-flash'
+  const model = process.env.GEMINI_MODEL || 'gemini-2.0-flash-lite'
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
     {
