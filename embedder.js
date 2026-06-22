@@ -13,14 +13,16 @@ export const EMBEDDING_DIM = parseInt(process.env.EMBEDDING_DIM ?? '768', 10)
 async function geminiEmbed(text) {
   const key = process.env.GEMINI_API_KEY
   if (!key) throw new Error('GEMINI_API_KEY not set')
+  const model = process.env.GEMINI_EMBED_MODEL ?? 'gemini-embedding-001'
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${key}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent?key=${key}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'models/text-embedding-004',
+        model: `models/${model}`,
         content: { parts: [{ text }] },
+        outputDimensionality: EMBEDDING_DIM,
       }),
     }
   )
