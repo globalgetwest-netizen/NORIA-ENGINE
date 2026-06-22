@@ -126,6 +126,24 @@ app.post('/v1/setup', async (req, res) => {
   }
 })
 
+// ── Admin: setup via browser (GET with ?secret=...) ──────────────────────────
+// Lets you run setup by pasting a URL in your browser address bar.
+app.get('/v1/setup', async (req, res) => {
+  const secret = process.env.NORIA_SETUP_SECRET
+  if (secret && req.query.secret !== secret) {
+    return res.status(401).send('Unauthorized — wrong or missing ?secret=')
+  }
+  if (!process.env.DATABASE_URL) return res.status(503).send('DATABASE_URL not configured')
+  try {
+    await setupSchema()
+    await seedKnowledge()
+    res.send('✅ NORIA setup complete — schema created and all knowledge (Africa + SkyGlobe) ingested into the database. You can close this tab.')
+  } catch (e) {
+    console.error('/v1/setup (GET) error:', e)
+    res.status(500).send('Setup failed: ' + e.message)
+  }
+})
+
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
   console.log(`NORIA engine listening on :${PORT} — provider=${activeProvider()} db=${!!process.env.DATABASE_URL}`)
