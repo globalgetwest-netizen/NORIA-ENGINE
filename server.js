@@ -84,8 +84,9 @@ app.get('/v1/test-llm', async (req, res) => {
   }
   // Test 3: full ask()
   try {
-    const result = await ask('Hello, are you working?', [])
-    results.ask = { ok: true, answer: result.answer?.slice(0, 200), provider: result.provider, llmError: result.llmError }
+    const testQuery = req.query.q ? String(req.query.q) : 'Hello, are you working?'
+    const result = await ask(testQuery, [])
+    results.ask = { ok: true, query: testQuery, answer: result.answer?.slice(0, 200), provider: result.provider, llmError: result.llmError, webResults: result.webResults, retrievedDocs: result.retrievedDocs }
   } catch (e) {
     results.ask = { ok: false, error: e.message }
   }
