@@ -38,8 +38,9 @@ async function geminiComplete(messages, opts = {}) {
     .filter((m) => m.role !== 'system')
     .map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }))
 
+  const model = process.env.GEMINI_MODEL || 'gemini-1.5-flash'
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -83,7 +84,9 @@ export async function complete(messages, opts = {}) {
     try {
       const text = await provider()
       if (text?.trim()) return text.trim()
+      console.warn('LLM provider returned empty response, trying next...')
     } catch (e) {
+      console.warn('LLM provider failed:', e.message)
       lastErr = e
     }
   }
