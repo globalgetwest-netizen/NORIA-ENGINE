@@ -68,6 +68,15 @@ app.get('/health', (req, res) => {
     service: 'noria-engine',
     provider: activeProvider(),
     db: !!process.env.DATABASE_URL,
+    // Safe diagnostics — booleans only, NEVER the actual key values
+    env: {
+      GEMINI_API_KEY: !!process.env.GEMINI_API_KEY,
+      OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
+      OLLAMA_BASE_URL: !!process.env.OLLAMA_BASE_URL,
+      GROQ_API_KEY: !!process.env.GROQ_API_KEY,
+      DATABASE_URL: !!process.env.DATABASE_URL,
+      NORIA_SETUP_SECRET: !!process.env.NORIA_SETUP_SECRET,
+    },
     time: new Date().toISOString(),
   })
 })
