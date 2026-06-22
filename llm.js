@@ -13,20 +13,39 @@ async function groqComplete(messages, opts = {}) {
   const key = process.env.GROQ_API_KEY
   if (!key) throw new Error('GROQ_API_KEY not set')
 
-  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-    body: JSON.stringify({
-      model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
-      messages,
-      max_tokens: opts.maxTokens ?? 1200,
-      temperature: opts.temperature ?? 0.4,
-      stream: false,
-    }),
-  })
-  if (!res.ok) throw new Error(`Groq error ${res.status}: ${await res.text()}`)
-  const data = await res.json()
-  return data.choices?.[0]?.message?.content ?? ''
+  // Primary model (high quality, 100K TPD), fallback to fast model (500K TPD)
+  const primaryModel = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile'
+  const fallbackModel = process.env.GROQ_FALLBACK_MODEL || 'llama-3.1-8b-instant'
+
+  for (const model of [primaryModel, fallbackModel]) {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+      body: JSON.stringify({
+        model,
+        messages,
+        max_tokens: opts.maxTokens ?? 1200,
+        temperature: opts.temperature ?? 0.4,
+        stream: false,
+      }),
+    })
+    if (res.ok) {
+      const data = await res.json()
+      const text = data.choices?.[0]?.message?.content ?? ''
+      if (text.trim()) {
+        if (model !== primaryModel) console.warn(`Groq: primary model hit limit, used ${model} instead`)
+        return text.trim()
+      }
+    }
+    const errText = await res.text()
+    // If daily/minute token limit hit, try next model — otherwise throw immediately
+    if (res.status === 429 && /tokens per day|TPD|tokens per minute|TPM/i.test(errText)) {
+      console.warn(`Groq model ${model} hit token limit, trying fallback...`)
+      continue
+    }
+    throw new Error(`Groq error ${res.status}: ${errText}`)
+  }
+  throw new Error('Groq: all models hit token limits for today')
 }
 
 async function geminiComplete(messages, opts = {}) {
