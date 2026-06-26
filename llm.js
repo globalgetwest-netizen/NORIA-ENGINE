@@ -65,7 +65,7 @@ async function openAICompatible({ url, key, models, messages, opts, extraHeaders
           model,
           messages,
           max_tokens: maxTokens,
-          temperature: opts.temperature ?? 0.4,
+          temperature: opts.temperature ?? 0.3,
           stream: false,
         }),
       })
