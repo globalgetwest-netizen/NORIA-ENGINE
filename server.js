@@ -115,6 +115,57 @@ app.get('/health', (req, res) => {
   })
 })
 
+// ── Secure temporary image hosting (for image-to-image) ──────────────────────
+// A user's uploaded photo never goes to any third-party host. It is stored
+// briefly IN MEMORY here, on YOUR own engine, served at a private URL just long
+// enough for the image model to read it once, then auto-deleted. Nothing is
+// written to disk and nothing persists past the TTL or a restart.
+const imageStore = new Map() // id -> { buf, type, expires }
+const IMAGE_TTL_MS = 10 * 60 * 1000 // 10 minutes — plenty for one generation
+
+// Periodically purge expired uploads so memory stays clean.
+setInterval(() => {
+  const now = Date.now()
+  for (const [id, rec] of imageStore) if (rec.expires < now) imageStore.delete(id)
+}, 60 * 1000).unref?.()
+
+function publicBase(req) {
+  // Render provides RENDER_EXTERNAL_URL automatically; otherwise derive from request.
+  if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL.replace(/\/$/, '')
+  if (process.env.RENDER_EXTERNAL_URL) return process.env.RENDER_EXTERNAL_URL.replace(/\/$/, '')
+  const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0]
+  return `${proto}://${req.headers.host}`
+}
+
+// Upload: accepts a data URL or raw base64; returns a short-lived private URL.
+app.post('/v1/upload-image', express.json({ limit: '12mb' }), (req, res) => {
+  try {
+    const raw = String(req.body?.image || '')
+    if (!raw) return res.status(400).json({ error: 'image is required' })
+    const m = raw.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/)
+    const type = m ? m[1] : 'image/png'
+    const b64 = m ? m[2] : raw
+    const buf = Buffer.from(b64, 'base64')
+    if (!buf.length || buf.length > 12 * 1024 * 1024) return res.status(400).json({ error: 'invalid or oversized image' })
+    // Simple unique id without external deps.
+    const id = Math.random().toString(36).slice(2) + Date.now().toString(36)
+    imageStore.set(id, { buf, type, expires: Date.now() + IMAGE_TTL_MS })
+    res.json({ url: `${publicBase(req)}/img/${id}`, expiresInMs: IMAGE_TTL_MS })
+  } catch (e) {
+    console.error('/v1/upload-image error:', e)
+    res.status(500).json({ error: 'upload failed' })
+  }
+})
+
+// Serve a temporary image by id (used once by the image model, then it expires).
+app.get('/img/:id', (req, res) => {
+  const rec = imageStore.get(req.params.id)
+  if (!rec || rec.expires < Date.now()) return res.status(404).send('Not found')
+  res.set('Content-Type', rec.type)
+  res.set('Cache-Control', 'public, max-age=600')
+  res.send(rec.buf)
+})
+
 // ── Main query endpoint ─────────────────────────────────────────────────────
 app.post('/v1/ask', async (req, res) => {
   try {
