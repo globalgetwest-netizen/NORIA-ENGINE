@@ -163,6 +163,93 @@ async function ollamaComplete(messages, opts = {}) {
   return data.message?.content ?? ''
 }
 
+// ── Streaming (Server-Sent Events) ───────────────────────────────────────────
+// OpenAI-compatible providers (Groq, Cerebras, OpenRouter) all stream tokens as
+// SSE lines: `data: {json}` with a delta in choices[0].delta.content. We parse
+// them and emit each token via onToken so the UI can render words as they arrive.
+// Once a stream has begun emitting, we COMMIT to it (return what we have on a
+// mid-stream error) so we never re-emit duplicate text from a retry.
+async function openAICompatibleStream({ url, key, models, messages, opts, extraHeaders = {} }, onToken) {
+  let lastErr = ''
+  for (const model of models) {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}`, ...extraHeaders },
+      body: JSON.stringify({
+        model,
+        messages,
+        max_tokens: opts.maxTokens ?? 1200,
+        temperature: opts.temperature ?? 0.3,
+        stream: true,
+      }),
+    })
+    if (!res.ok) {
+      const errText = await res.text()
+      lastErr = `${model} ${res.status}: ${errText}`
+      if (res.status === 429 && isTokenLimit(errText)) break // next model on this key
+      throw new Error(lastErr) // other error → caller fails over to next key/provider
+    }
+    // Stream the body. From here we are committed to this attempt.
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = '', full = ''
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        let nl
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).trim()
+          buf = buf.slice(nl + 1)
+          if (!line.startsWith('data:')) continue
+          const data = line.slice(5).trim()
+          if (data === '[DONE]') return full
+          try {
+            const json = JSON.parse(data)
+            const delta = json.choices?.[0]?.delta?.content || ''
+            if (delta) { full += delta; onToken(delta) }
+          } catch (_) { /* ignore keep-alive / partial lines */ }
+        }
+      }
+    } catch (e) {
+      if (full.trim()) return full // mid-stream drop → keep what we have
+      lastErr = `${model}: stream error ${e.message}`
+      throw new Error(lastErr)
+    }
+    if (full.trim()) return full
+    lastErr = `${model}: empty stream`
+  }
+  throw new Error(lastErr || 'all models exhausted')
+}
+
+export async function completeStream(messages, opts = {}, onToken = () => {}) {
+  const attempts = []
+  for (const key of rotate(GROQ_KEYS))
+    attempts.push({ name: `groq#${GROQ_KEYS.indexOf(key) + 1}`, fn: () => openAICompatibleStream({ url: 'https://api.groq.com/openai/v1/chat/completions', key, models: [process.env.GROQ_MODEL || 'llama-3.3-70b-versatile', process.env.GROQ_FALLBACK_MODEL || 'llama-3.1-8b-instant'], messages, opts }, onToken) })
+  for (const key of rotate(CEREBRAS_KEYS))
+    attempts.push({ name: `cerebras#${CEREBRAS_KEYS.indexOf(key) + 1}`, fn: () => openAICompatibleStream({ url: 'https://api.cerebras.ai/v1/chat/completions', key, models: [process.env.CEREBRAS_MODEL || 'llama-3.3-70b', process.env.CEREBRAS_FALLBACK_MODEL || 'llama3.1-8b'], messages, opts }, onToken) })
+  for (const key of rotate(OPENROUTER_KEYS))
+    attempts.push({ name: `openrouter#${OPENROUTER_KEYS.indexOf(key) + 1}`, fn: () => openAICompatibleStream({ url: 'https://openrouter.ai/api/v1/chat/completions', key, models: [process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free', process.env.OPENROUTER_FALLBACK_MODEL || 'meta-llama/llama-3.1-8b-instruct:free'], messages, opts, extraHeaders: { 'HTTP-Referer': process.env.OPENROUTER_REFERER || 'https://noria-engine.onrender.com', 'X-Title': process.env.OPENROUTER_TITLE || 'Noria' } }, onToken) })
+
+  const errors = []
+  for (const { name, fn } of attempts) {
+    try {
+      const text = await fn()
+      if (text?.trim()) return text.trim()
+      errors.push(`${name}: empty`)
+    } catch (e) {
+      console.warn('LLM stream attempt failed:', `${name}: ${e.message}`)
+      errors.push(`${name}: ${e.message}`)
+    }
+  }
+  // Last resort — non-streaming providers (Gemini/Ollama) or any remaining path.
+  // Emit the whole answer as one chunk so the caller still gets a result.
+  const text = await complete(messages, opts)
+  if (text?.trim()) { onToken(text); return text.trim() }
+  throw new Error('All streaming attempts failed → ' + errors.join(' | '))
+}
+
 export async function complete(messages, opts = {}) {
   // Build the ordered list of attempts: every Groq key, then every Cerebras key,
   // then every OpenRouter key, then optional Gemini, then optional Ollama.
