@@ -8,7 +8,7 @@
  * a minimal fallback used if the caller sends no system prompt.
  */
 
-import { complete, activeProvider } from './llm.js'
+import { complete, completeStream, activeProvider } from './llm.js'
 import { embed } from './embedder.js'
 import { similaritySearch } from './vectorstore.js'
 import { needsLiveSearch, webSearch, formatSearchContext } from './searcher.js'
@@ -112,6 +112,92 @@ export async function ask(query, historyMessages = [], system = '') {
   console.log(
     JSON.stringify({
       event: 'noria_query',
+      query: query.slice(0, 100),
+      retrievedDocs: retrievedDocs.length,
+      webResults: webResults.length,
+      provider,
+      ms: Date.now() - start,
+    })
+  )
+
+  return { answer, sources, retrievedDocs: retrievedDocs.length, webResults: webResults.length, provider, llmError }
+}
+
+/**
+ * Streaming variant of ask(): runs the same guardrail + RAG + web pipeline,
+ * then streams the LLM answer token-by-token through onToken(delta).
+ * Resolves to the same shape as ask() once the stream completes.
+ */
+export async function askStream(query, historyMessages = [], system = '', onToken = () => {}) {
+  const start = Date.now()
+
+  const systemPrompt =
+    typeof system === 'string' && system.trim().length > 0 ? system : NORIA_FALLBACK_SYSTEM
+
+  if (detectInjection(query)) {
+    const msg =
+      "That sits at the edge of what I can engage with directly — but I'm here for anything else you need: writing, analysis, documents, immigration, business, or any question at all."
+    onToken(msg)
+    return { answer: msg, sources: [], retrievedDocs: 0, webResults: 0, provider: 'guardrail' }
+  }
+
+  let retrievedDocs = []
+  let ragContext = ''
+  if (process.env.DATABASE_URL) {
+    try {
+      const queryVec = await embed(query)
+      retrievedDocs = await similaritySearch(queryVec, 5)
+      const relevant = retrievedDocs.filter((d) => d.similarity > 0.5)
+      if (relevant.length > 0) {
+        ragContext =
+          '\n\n[Background knowledge — use this to inform your answer, written naturally as your own knowledge. Do NOT cite, footnote, or mention these as sources]:\n' +
+          relevant.map((d) => `${d.content}`).join('\n\n')
+      }
+    } catch (e) {
+      console.warn('NORIA RAG retrieval failed (continuing without):', e.message)
+    }
+  }
+
+  let webResults = []
+  let webContext = ''
+  if (needsLiveSearch(query)) {
+    try {
+      webResults = await webSearch(query)
+      webContext = formatSearchContext(webResults)
+    } catch (e) {
+      console.warn('NORIA web search failed (continuing without):', e.message)
+    }
+  }
+
+  const contextBlock = ragContext + webContext
+  const userContent = contextBlock ? `${query}\n\n${contextBlock}` : query
+
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...historyMessages.slice(-8),
+    { role: 'user', content: userContent },
+  ]
+
+  let answer = ''
+  let provider = activeProvider()
+  let llmError = null
+  try {
+    answer = await completeStream(messages, { maxTokens: 4000, temperature: 0.4 }, onToken)
+  } catch (e) {
+    console.error('NORIA LLM stream error:', e.message)
+    llmError = e.message
+    answer = 'Noria is momentarily unavailable. Please try again in a few seconds.'
+    provider = 'fallback'
+  }
+
+  const sources = [
+    ...retrievedDocs.filter((d) => d.similarity > 0.5).map((d) => d.source),
+    ...webResults.map((r) => r.url).filter(Boolean),
+  ].slice(0, 5)
+
+  console.log(
+    JSON.stringify({
+      event: 'noria_query_stream',
       query: query.slice(0, 100),
       retrievedDocs: retrievedDocs.length,
       webResults: webResults.length,
