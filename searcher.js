@@ -1,108 +1,219 @@
 /**
- * NORIA Web Search Grounding — 5-layer search stack, never empty.
- *   1. Tavily AI Search     (1,000 free/month — best for AI)
- *   2. Serper.dev           (2,500 free searches)
- *   3. Google Custom Search (100 free/day = 3,000/month)
- *   4. You.com Search API   (1,000 free/month)
- *   5. DuckDuckGo           (unlimited free fallback, no key needed)
+ * NORIA Live Search — free, no-API-key web & real-time grounding.
+ *
+ * Every source here is FREE, requires NO API key, and is usable worldwide,
+ * so it serves an unlimited number of users at $0:
+ *   - Wikipedia (REST search + summary)  — encyclopedic & reasonably current facts
+ *   - DuckDuckGo Instant Answer          — quick definitions / direct answers
+ *   - Frankfurter (European Central Bank)— live currency exchange rates
+ *   - CoinGecko                          — live cryptocurrency prices
+ *   - Open-Meteo (+ its free geocoder)   — live weather, no key
+ *
+ * The engine calls:
+ *   needsLiveSearch(query)    -> boolean   (should we fetch live data?)
+ *   webSearch(query)          -> [{title, snippet, url, kind}]
+ *   formatSearchContext(rows) -> string    (block injected into the prompt)
+ *
+ * All network calls are time-boxed and fail soft: if a source is slow or down,
+ * it is skipped and Noria simply answers from her own knowledge.
  */
 
-const NEEDS_LIVE_RE =
-  /conference|event|news|current|latest|today|2024|2025|2026|deadline|price|rate|opening|scholarship|application|embassy|appointment|election|coup|war|attack|crisis|conflict|protest|flood|earthquake|hurricane|pandemic|vaccine|sanction|policy|law|bill|summit|treaty|agreement|stock|market|currency|inflation|gdp|budget|president|prime minister|government|minister|arrest|killed|died|death|born|won|lost|signed|launched|announced|released|discovered/i
+const FETCH_TIMEOUT_MS = 6000
+const UA = 'NoriaBot/1.0 (+https://skyglobegroup.com)'
+
+async function fetchJSON(url, opts = {}) {
+  const ctrl = new AbortController()
+  const to = setTimeout(() => ctrl.abort(), opts.timeout || FETCH_TIMEOUT_MS)
+  try {
+    const res = await fetch(url, {
+      ...opts,
+      signal: ctrl.signal,
+      headers: { 'User-Agent': UA, Accept: 'application/json', ...(opts.headers || {}) },
+    })
+    if (!res.ok) return null
+    return await res.json()
+  } catch (_) {
+    return null
+  } finally {
+    clearTimeout(to)
+  }
+}
+
+// ── When do we need live data? ───────────────────────────────────────────────
+// Trigger on recency words, money/markets, weather, news, sports, current
+// office-holders, and explicit recent years. Deliberately conservative so we
+// don't add latency to ordinary questions.
+const LIVE_PATTERNS = [
+  /\b(latest|current|currently|recent|recently|today|tonight|now|this (week|month|year)|up[\s-]?to[\s-]?date|breaking|as of)\b/i,
+  /\b(news|headlines?|happening|developments?)\b/i,
+  /\b(price|prices|cost|costs|rate|rates|exchange rate|stock|shares?|market|markets|inflation|gdp)\b/i,
+  /\b(weather|temperature|forecast|how (hot|cold|warm))\b/i,
+  /\bwho('?s| is| are)? (the )?(current|present|new)?\s*(president|prime minister|pm|ceo|leader|king|queen|pope|chancellor|governor|mayor)\b/i,
+  /\b(score|scores|results?|final score|who won|winner|standings|fixtures?)\b/i,
+  /\bhow much (is|are|does|do)\b/i,
+  /\b20(2[4-9]|[3-9]\d)\b/, // 2024 and later
+  // bare currency pair, e.g. "USD to EUR", "GBP/NGN", "EUR = USD"
+  /\b(USD|EUR|GBP|JPY|CNY|CHF|CAD|AUD|NZD|INR|NGN|GHS|ZAR|KES|EGP|AED|SAR|BRL|RUB|TRY|SEK|NOK|DKK|PLN|MXN|SGD|HKD|KRW)\b\s*(?:to|in|vs|=|\/)?\s*\b(USD|EUR|GBP|JPY|CNY|CHF|CAD|AUD|NZD|INR|NGN|GHS|ZAR|KES|EGP|AED|SAR|BRL|RUB|TRY|SEK|NOK|DKK|PLN|MXN|SGD|HKD|KRW)\b/i,
+]
 
 export function needsLiveSearch(query) {
-  return NEEDS_LIVE_RE.test(query)
+  if (!query || typeof query !== 'string') return false
+  const q = query.trim()
+  if (q.length < 3) return false
+  return LIVE_PATTERNS.some((p) => p.test(q))
 }
 
-async function tavilySearch(query) {
-  const key = process.env.TAVILY_API_KEY
-  if (!key) throw new Error('TAVILY_API_KEY not set')
-  const res = await fetch('https://api.tavily.com/search', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ api_key: key, query, search_depth: 'basic', max_results: 5 }),
-  })
-  if (!res.ok) throw new Error(`Tavily error ${res.status}`)
-  const data = await res.json()
-  return (data.results ?? []).slice(0, 5).map((r) => ({ title: r.title, url: r.url, snippet: r.content ?? '' }))
-}
-
-async function serperSearch(query) {
-  const key = process.env.SERPER_API_KEY
-  if (!key) throw new Error('SERPER_API_KEY not set')
-  const res = await fetch('https://google.serper.dev/search', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-API-KEY': key },
-    body: JSON.stringify({ q: query, num: 5 }),
-  })
-  if (!res.ok) throw new Error(`Serper error ${res.status}`)
-  const data = await res.json()
-  return (data.organic ?? []).slice(0, 5).map((r) => ({ title: r.title, url: r.link, snippet: r.snippet ?? '' }))
-}
-
-async function googleSearch(query) {
-  const key = process.env.GOOGLE_SEARCH_KEY
-  const cx = process.env.GOOGLE_SEARCH_CX
-  if (!key || !cx) throw new Error('GOOGLE_SEARCH_KEY or GOOGLE_SEARCH_CX not set')
-  const url = `https://www.googleapis.com/customsearch/v1?key=${key}&cx=${cx}&q=${encodeURIComponent(query)}&num=5`
-  const res = await fetch(url)
-  if (!res.ok) throw new Error(`Google search error ${res.status}`)
-  const data = await res.json()
-  return (data.items ?? []).slice(0, 5).map((r) => ({ title: r.title, url: r.link, snippet: r.snippet ?? '' }))
-}
-
-async function youSearch(query) {
-  const key = process.env.YOU_API_KEY
-  if (!key) throw new Error('YOU_API_KEY not set')
-  const url = `https://api.you.com/search?query=${encodeURIComponent(query)}&num_web_results=5`
-  const res = await fetch(url, {
-    headers: { 'X-API-Key': key },
-  })
-  if (!res.ok) throw new Error(`You.com search error ${res.status}`)
-  const data = await res.json()
-  return (data.hits ?? data.web_results ?? []).slice(0, 5).map((r) => ({
-    title: r.title ?? r.name ?? '',
-    url: r.url ?? r.link ?? '',
-    snippet: r.description ?? r.snippet ?? '',
-  }))
-}
-
-async function duckduckgoSearch(query) {
-  const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`
-  const res = await fetch(url, { headers: { 'User-Agent': 'NORIA/1.0 (SkyGlobe AI assistant)' } })
-  if (!res.ok) return []
-  const data = await res.json()
-  const results = []
-  if (data.AbstractText)
-    results.push({ title: data.Heading ?? query, url: data.AbstractURL ?? '', snippet: data.AbstractText })
-  for (const r of (data.RelatedTopics ?? []).slice(0, 4)) {
-    if (r.Text) results.push({ title: r.Text.slice(0, 60), url: r.FirstURL ?? '', snippet: r.Text })
+// ── Currency exchange rates (Frankfurter / ECB) ──────────────────────────────
+const CURRENCIES = '(USD|EUR|GBP|JPY|CNY|CHF|CAD|AUD|NZD|INR|NGN|GHS|ZAR|KES|EGP|AED|SAR|BRL|RUB|TRY|SEK|NOK|DKK|PLN|MXN|SGD|HKD|KRW)'
+async function currencyLookup(query) {
+  const m = query.toUpperCase().match(new RegExp(`${CURRENCIES}\\s*(?:TO|IN|=|\\/|VS)\\s*${CURRENCIES}`))
+  if (!m) return null
+  const from = m[1], to = m[2]
+  const data = await fetchJSON(`https://api.frankfurter.app/latest?from=${from}&to=${to}`)
+  if (!data?.rates?.[to]) return null
+  return {
+    kind: 'currency',
+    title: `Exchange rate ${from} → ${to}`,
+    snippet: `1 ${from} = ${data.rates[to]} ${to} (as of ${data.date}, European Central Bank reference rate).`,
+    url: 'https://www.ecb.europa.eu',
   }
-  return results
 }
 
+// ── Crypto prices (CoinGecko) ────────────────────────────────────────────────
+const COIN_IDS = {
+  bitcoin: 'bitcoin', btc: 'bitcoin', ethereum: 'ethereum', eth: 'ethereum',
+  bnb: 'binancecoin', solana: 'solana', sol: 'solana', xrp: 'ripple', ripple: 'ripple',
+  cardano: 'cardano', ada: 'cardano', dogecoin: 'dogecoin', doge: 'dogecoin',
+  litecoin: 'litecoin', ltc: 'litecoin', usdt: 'tether', tether: 'tether',
+}
+async function cryptoLookup(query) {
+  const q = query.toLowerCase()
+  const hit = Object.keys(COIN_IDS).find((k) => new RegExp(`\\b${k}\\b`).test(q))
+  if (!hit) return null
+  const id = COIN_IDS[hit]
+  const data = await fetchJSON(
+    `https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd&include_24hr_change=true`
+  )
+  const row = data?.[id]
+  if (!row?.usd) return null
+  const chg = typeof row.usd_24h_change === 'number' ? ` (${row.usd_24h_change.toFixed(2)}% in 24h)` : ''
+  return {
+    kind: 'crypto',
+    title: `${hit.toUpperCase()} price`,
+    snippet: `${id} is currently $${row.usd.toLocaleString('en-US')} USD${chg}.`,
+    url: 'https://www.coingecko.com',
+  }
+}
+
+// ── Weather (Open-Meteo, with its free geocoder) ─────────────────────────────
+async function weatherLookup(query) {
+  if (!/\b(weather|temperature|forecast|how (hot|cold|warm))\b/i.test(query)) return null
+  // crude place extraction: "weather in X" / "X weather"
+  let place = null
+  const m1 = query.match(/\b(?:weather|temperature|forecast)\s+(?:in|at|for)\s+([A-Za-zÀ-ɏ .'-]{2,40})/i)
+  const m2 = query.match(/\bin\s+([A-Za-zÀ-ɏ .'-]{2,40})\b/i)
+  place = (m1 && m1[1]) || (m2 && m2[1]) || null
+  if (!place) return null
+  place = place.replace(/[?.!,]+$/, '').trim()
+  const geo = await fetchJSON(
+    `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(place)}&count=1`
+  )
+  const loc = geo?.results?.[0]
+  if (!loc) return null
+  const wx = await fetchJSON(
+    `https://api.open-meteo.com/v1/forecast?latitude=${loc.latitude}&longitude=${loc.longitude}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code`
+  )
+  const c = wx?.current
+  if (!c) return null
+  return {
+    kind: 'weather',
+    title: `Weather in ${loc.name}${loc.country ? ', ' + loc.country : ''}`,
+    snippet: `Currently ${c.temperature_2m}°C, humidity ${c.relative_humidity_2m}%, wind ${c.wind_speed_10m} km/h (live).`,
+    url: 'https://open-meteo.com',
+  }
+}
+
+// ── Wikipedia (search → summaries) ───────────────────────────────────────────
+async function wikipediaLookup(query) {
+  const search = await fetchJSON(
+    `https://en.wikipedia.org/w/api.php?action=query&list=search&srlimit=3&format=json&origin=*&srsearch=${encodeURIComponent(query)}`
+  )
+  const hits = search?.query?.search || []
+  if (!hits.length) return []
+  const rows = []
+  for (const h of hits.slice(0, 2)) {
+    const sum = await fetchJSON(
+      `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(h.title.replace(/ /g, '_'))}`
+    )
+    if (sum?.extract) {
+      rows.push({
+        kind: 'wikipedia',
+        title: sum.title || h.title,
+        snippet: sum.extract,
+        url: sum.content_urls?.desktop?.page || `https://en.wikipedia.org/wiki/${encodeURIComponent(h.title)}`,
+      })
+    }
+  }
+  return rows
+}
+
+// ── DuckDuckGo Instant Answer ────────────────────────────────────────────────
+async function duckduckgoLookup(query) {
+  const data = await fetchJSON(
+    `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`
+  )
+  if (!data) return []
+  const rows = []
+  if (data.AbstractText) {
+    rows.push({ kind: 'web', title: data.Heading || query, snippet: data.AbstractText, url: data.AbstractURL || '' })
+  } else if (data.Answer) {
+    rows.push({ kind: 'web', title: data.AnswerType || query, snippet: String(data.Answer), url: '' })
+  }
+  return rows
+}
+
+// ── Orchestrator ─────────────────────────────────────────────────────────────
 export async function webSearch(query) {
-  if (process.env.TAVILY_API_KEY) {
-    try { const r = await tavilySearch(query); if (r.length) return r } catch (_) {}
+  if (!query) return []
+  // Run structured lookups (fast, exact) and general lookups in parallel.
+  const settled = await Promise.allSettled([
+    currencyLookup(query),
+    cryptoLookup(query),
+    weatherLookup(query),
+    wikipediaLookup(query),
+    duckduckgoLookup(query),
+  ])
+
+  const results = []
+  for (const s of settled) {
+    if (s.status !== 'fulfilled' || !s.value) continue
+    if (Array.isArray(s.value)) results.push(...s.value)
+    else results.push(s.value)
   }
-  if (process.env.SERPER_API_KEY) {
-    try { const r = await serperSearch(query); if (r.length) return r } catch (_) {}
+
+  // De-duplicate by title, keep structured (currency/crypto/weather) first.
+  const order = { currency: 0, crypto: 0, weather: 0, web: 1, wikipedia: 2 }
+  results.sort((a, b) => (order[a.kind] ?? 3) - (order[b.kind] ?? 3))
+  const seen = new Set()
+  const unique = []
+  for (const r of results) {
+    const key = (r.title || '').toLowerCase().trim()
+    if (key && seen.has(key)) continue
+    seen.add(key)
+    unique.push(r)
   }
-  if (process.env.GOOGLE_SEARCH_KEY && process.env.GOOGLE_SEARCH_CX) {
-    try { const r = await googleSearch(query); if (r.length) return r } catch (_) {}
-  }
-  if (process.env.YOU_API_KEY) {
-    try { const r = await youSearch(query); if (r.length) return r } catch (_) {}
-  }
-  return duckduckgoSearch(query)
+  return unique.slice(0, 5)
 }
 
+// ── Format into a prompt context block ───────────────────────────────────────
 export function formatSearchContext(results) {
-  if (!results.length) return ''
+  if (!results || !results.length) return ''
+  const today = new Date().toISOString().slice(0, 10)
+  const lines = results.map((r) => `• ${r.title}: ${r.snippet}`).join('\n')
   return (
-    '\n\n[Live web sources retrieved ' +
-    new Date().toISOString().slice(0, 10) +
-    ']:\n' +
-    results.map((r, i) => `[${i + 1}] ${r.title}\n    ${r.snippet}\n    Source: ${r.url}`).join('\n\n')
+    '\n\n[LIVE INFORMATION retrieved just now — use it so your answer reflects the most current facts. ' +
+    'Weave it naturally into your answer as your own knowledge. Do NOT cite, footnote, or list these as sources]:\n' +
+    lines +
+    `\n(Live data retrieved ${today})`
   )
 }
