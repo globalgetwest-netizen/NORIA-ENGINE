@@ -2,17 +2,19 @@
  * NORIA LLM Layer — model abstraction with multi-key rotation.
  *
  * Provider chain (all free tier):
- *   1. Groq     (llama-3.3-70b-versatile → llama-3.1-8b-instant fallback)
- *   2. Cerebras (llama-3.3-70b → llama3.1-8b fallback) — 1M tokens/day free
- *   3. Gemini   (only if GEMINI_ENABLED=true — most free projects have quota 0)
- *   4. Ollama   (local, 100% free)
+ *   1. Groq       (llama-3.3-70b-versatile → llama-3.1-8b-instant fallback)
+ *   2. Cerebras   (llama-3.3-70b → llama3.1-8b fallback) — 1M tokens/day free
+ *   3. OpenRouter (llama-3.3-70b-instruct:free → fallback free model)
+ *   4. Gemini     (only if GEMINI_ENABLED=true — most free projects have quota 0)
+ *   5. Ollama     (local, 100% free)
  *
  * MULTI-KEY ROTATION
  * ──────────────────
  * Supply multiple keys to multiply your daily free capacity at $0:
- *   GROQ_API_KEYS     = key1,key2,key3      (comma-separated)
- *   CEREBRAS_API_KEYS = keyA,keyB
- * The singular GROQ_API_KEY / CEREBRAS_API_KEY are also honoured.
+ *   GROQ_API_KEYS       = key1,key2,key3      (comma-separated)
+ *   CEREBRAS_API_KEYS   = keyA,keyB
+ *   OPENROUTER_API_KEYS = keyX,keyY
+ * The singular GROQ_API_KEY / CEREBRAS_API_KEY / OPENROUTER_API_KEY are also honoured.
  *
  * Keys are tried round-robin (load spreads evenly), and when one hits its
  * daily/minute token limit NORIA automatically advances to the next key,
@@ -31,6 +33,7 @@ function parseKeys(...envNames) {
 
 const GROQ_KEYS = parseKeys('GROQ_API_KEYS', 'GROQ_API_KEY')
 const CEREBRAS_KEYS = parseKeys('CEREBRAS_API_KEYS', 'CEREBRAS_API_KEY')
+const OPENROUTER_KEYS = parseKeys('OPENROUTER_API_KEYS', 'OPENROUTER_API_KEY')
 
 // Round-robin cursor so load spreads across keys instead of always hammering #1.
 let rotation = 0
@@ -42,13 +45,13 @@ function rotate(arr) {
 
 const isTokenLimit = (s) => /tokens per day|TPD|tokens per minute|TPM|rate.?limit|RESOURCE_EXHAUSTED|\b429\b/i.test(s)
 
-// ── OpenAI-compatible completion (Groq + Cerebras share this shape) ────────────
-async function openAICompatible({ url, key, models, messages, opts }) {
+// ── OpenAI-compatible completion (Groq + Cerebras + OpenRouter share this shape) ─
+async function openAICompatible({ url, key, models, messages, opts, extraHeaders = {} }) {
   let lastErr = ''
   for (const model of models) {
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}`, ...extraHeaders },
       body: JSON.stringify({
         model,
         messages,
@@ -88,6 +91,26 @@ async function cerebrasComplete(key, messages, opts = {}) {
     process.env.CEREBRAS_FALLBACK_MODEL || 'llama3.1-8b',
   ]
   return openAICompatible({ url: 'https://api.cerebras.ai/v1/chat/completions', key, models, messages, opts })
+}
+
+async function openRouterComplete(key, messages, opts = {}) {
+  const models = [
+    process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free',
+    process.env.OPENROUTER_FALLBACK_MODEL || 'meta-llama/llama-3.1-8b-instruct:free',
+  ]
+  // OpenRouter recommends these headers for free-tier identification/ranking.
+  const extraHeaders = {
+    'HTTP-Referer': process.env.OPENROUTER_REFERER || 'https://noria-engine.onrender.com',
+    'X-Title': process.env.OPENROUTER_TITLE || 'Noria',
+  }
+  return openAICompatible({
+    url: 'https://openrouter.ai/api/v1/chat/completions',
+    key,
+    models,
+    messages,
+    opts,
+    extraHeaders,
+  })
 }
 
 async function geminiComplete(messages, opts = {}) {
@@ -130,19 +153,22 @@ async function ollamaComplete(messages, opts = {}) {
 
 export async function complete(messages, opts = {}) {
   // Build the ordered list of attempts: every Groq key, then every Cerebras key,
-  // then optional Gemini, then optional Ollama. Keys are rotated for load spread.
+  // then every OpenRouter key, then optional Gemini, then optional Ollama.
+  // Keys are rotated for load spread.
   const attempts = []
   for (const key of rotate(GROQ_KEYS))
     attempts.push({ name: `groq#${GROQ_KEYS.indexOf(key) + 1}`, fn: () => groqComplete(key, messages, opts) })
   for (const key of rotate(CEREBRAS_KEYS))
     attempts.push({ name: `cerebras#${CEREBRAS_KEYS.indexOf(key) + 1}`, fn: () => cerebrasComplete(key, messages, opts) })
+  for (const key of rotate(OPENROUTER_KEYS))
+    attempts.push({ name: `openrouter#${OPENROUTER_KEYS.indexOf(key) + 1}`, fn: () => openRouterComplete(key, messages, opts) })
   if (process.env.GEMINI_API_KEY && process.env.GEMINI_ENABLED === 'true')
     attempts.push({ name: 'gemini', fn: () => geminiComplete(messages, opts) })
   if (process.env.OLLAMA_BASE_URL || process.env.OLLAMA_MODEL)
     attempts.push({ name: 'ollama', fn: () => ollamaComplete(messages, opts) })
 
   if (attempts.length === 0)
-    throw new Error('No LLM provider configured. Set GROQ_API_KEY(S), CEREBRAS_API_KEY(S), GEMINI_API_KEY, or OLLAMA_BASE_URL.')
+    throw new Error('No LLM provider configured. Set GROQ_API_KEY(S), CEREBRAS_API_KEY(S), OPENROUTER_API_KEY(S), GEMINI_API_KEY, or OLLAMA_BASE_URL.')
 
   const errors = []
   for (const { name, fn } of attempts) {
@@ -163,6 +189,7 @@ export async function complete(messages, opts = {}) {
 export function activeProvider() {
   if (GROQ_KEYS.length) return GROQ_KEYS.length > 1 ? `groq (${GROQ_KEYS.length} keys)` : 'groq'
   if (CEREBRAS_KEYS.length) return CEREBRAS_KEYS.length > 1 ? `cerebras (${CEREBRAS_KEYS.length} keys)` : 'cerebras'
+  if (OPENROUTER_KEYS.length) return OPENROUTER_KEYS.length > 1 ? `openrouter (${OPENROUTER_KEYS.length} keys)` : 'openrouter'
   if (process.env.GEMINI_API_KEY) return 'gemini'
   if (process.env.OLLAMA_BASE_URL || process.env.OLLAMA_MODEL) return 'ollama'
   return 'none'
