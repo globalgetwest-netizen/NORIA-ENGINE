@@ -44,35 +44,47 @@ function rotate(arr) {
 }
 
 const isTokenLimit = (s) => /tokens per day|TPD|tokens per minute|TPM|rate.?limit|RESOURCE_EXHAUSTED|\b429\b/i.test(s)
+// Context-window / payload-too-large errors (e.g. Cerebras free tier = 8192 tokens).
+// These are NOT quota errors — retrying the same request won't help, but a smaller
+// output budget might let it through, so we handle them distinctly.
+const isContextError = (s) =>
+  /context (length|window)|maximum context|too (long|large)|reduce (the )?length|max_tokens|please reduce|exceeds? .*(context|token)/i.test(s)
 
 // ── OpenAI-compatible completion (Groq + Cerebras + OpenRouter share this shape) ─
 async function openAICompatible({ url, key, models, messages, opts, extraHeaders = {} }) {
   let lastErr = ''
   for (const model of models) {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}`, ...extraHeaders },
-      body: JSON.stringify({
-        model,
-        messages,
-        max_tokens: opts.maxTokens ?? 1200,
-        temperature: opts.temperature ?? 0.4,
-        stream: false,
-      }),
-    })
-    if (res.ok) {
-      const data = await res.json()
-      const text = data.choices?.[0]?.message?.content ?? ''
-      if (text.trim()) return text.trim()
-      lastErr = `${model}: empty response`
-      continue
+    // Try the requested output budget first; if the provider rejects it for being
+    // too large for its context window, retry once with a smaller budget so a long
+    // document still completes on a small-context provider instead of failing.
+    for (const maxTokens of [opts.maxTokens ?? 1200, 1500]) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}`, ...extraHeaders },
+        body: JSON.stringify({
+          model,
+          messages,
+          max_tokens: maxTokens,
+          temperature: opts.temperature ?? 0.4,
+          stream: false,
+        }),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        const text = data.choices?.[0]?.message?.content ?? ''
+        if (text.trim()) return text.trim()
+        lastErr = `${model}: empty response`
+        break // empty → try the next model, not a smaller budget
+      }
+      const errText = await res.text()
+      lastErr = `${model} ${res.status}: ${errText}`
+      // Context too large → retry this model once with a smaller output budget.
+      if (isContextError(errText) && maxTokens !== 1500) continue
+      // Token-limit → move to the next (cheaper/higher-quota) model on this key.
+      if (res.status === 429 && isTokenLimit(errText)) break
+      // Any other error → stop trying models on this key (caller fails over).
+      throw new Error(lastErr)
     }
-    const errText = await res.text()
-    lastErr = `${model} ${res.status}: ${errText}`
-    // Token-limit → try the next (cheaper/higher-quota) model on this key.
-    if (res.status === 429 && isTokenLimit(errText)) continue
-    // Any other error → stop trying models on this key.
-    throw new Error(lastErr)
   }
   throw new Error(lastErr || 'all models exhausted')
 }
