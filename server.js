@@ -107,6 +107,7 @@ app.get('/health', (req, res) => {
       OLLAMA_BASE_URL: !!process.env.OLLAMA_BASE_URL,
       GROQ_API_KEY: !!(process.env.GROQ_API_KEYS || process.env.GROQ_API_KEY),
       CEREBRAS_API_KEY: !!(process.env.CEREBRAS_API_KEYS || process.env.CEREBRAS_API_KEY),
+      OPENROUTER_API_KEY: !!(process.env.OPENROUTER_API_KEYS || process.env.OPENROUTER_API_KEY),
       DATABASE_URL: !!process.env.DATABASE_URL,
       NORIA_SETUP_SECRET: !!process.env.NORIA_SETUP_SECRET,
     },
@@ -126,7 +127,11 @@ app.post('/v1/ask', async (req, res) => {
       .filter((m) => m.role === 'user' || m.role === 'assistant')
       .map((m) => ({ role: m.role, content: String(m.content) }))
 
-    const result = await ask(query, history)
+    // THE FIX: forward the system prompt sent by the frontend so Noria's full
+    // identity, language law, and writing rules actually reach the model.
+    const system = typeof req.body?.system === 'string' ? req.body.system : ''
+
+    const result = await ask(query, history, system)
     res.json(result)
   } catch (e) {
     console.error('/v1/ask error:', e)
