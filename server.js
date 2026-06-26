@@ -14,7 +14,7 @@
 import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
-import { ask } from './engine.js'
+import { ask, askStream } from './engine.js'
 import { ingestText } from './ingest.js'
 import { setupSchema } from './vectorstore.js'
 import { seedKnowledge } from './ingest.js'
@@ -191,6 +191,39 @@ app.post('/v1/ask', async (req, res) => {
         'NORIA is temporarily unavailable. Please try again shortly or contact support@skyglobegroup.com.',
       sources: [],
     })
+  }
+})
+
+// ── Streaming query (Server-Sent Events) ─────────────────────────────────────
+// Emits: {token:"..."} per chunk, then a final {done:true, sources, provider}.
+// On failure: {error:true, answer:"..."}. The frontend renders tokens live.
+app.post('/v1/ask/stream', async (req, res) => {
+  const query = String(req.body?.query ?? req.body?.message ?? '').trim()
+  if (!query) return res.status(400).json({ error: 'query is required' })
+  if (query.length > 2000) return res.status(400).json({ error: 'query too long (max 2000 chars)' })
+
+  const rawHistory = Array.isArray(req.body?.history) ? req.body.history.slice(-10) : []
+  const history = rawHistory
+    .filter((m) => m.role === 'user' || m.role === 'assistant')
+    .map((m) => ({ role: m.role, content: String(m.content) }))
+  const system = typeof req.body?.system === 'string' ? req.body.system : ''
+
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-cache, no-transform')
+  res.setHeader('Connection', 'keep-alive')
+  res.setHeader('X-Accel-Buffering', 'no') // disable proxy buffering so tokens flush
+  if (res.flushHeaders) res.flushHeaders()
+
+  const send = (obj) => { res.write(`data: ${JSON.stringify(obj)}\n\n`) }
+
+  try {
+    const result = await askStream(query, history, system, (token) => send({ token }))
+    send({ done: true, sources: result.sources || [], provider: result.provider })
+    res.end()
+  } catch (e) {
+    console.error('/v1/ask/stream error:', e)
+    send({ error: true, answer: 'Noria is momentarily unavailable. Please try again in a few seconds.' })
+    res.end()
   }
 })
 
