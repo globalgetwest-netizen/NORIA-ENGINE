@@ -56,10 +56,10 @@ const isModelError = (status, s) =>
 const isDailyLimit = (s) => /tokens per day|TPD|per day|RESOURCE_EXHAUSTED|quota/i.test(s)
 const _cooldown = new Map() // id -> epoch ms until which to skip this key
 const onCooldown = (id) => { const t = _cooldown.get(id); return t && Date.now() < t }
-function parkCooldown(id, msg) {
-  // Honour "try again in 6m2s" if present, else default 6 minutes.
+function parkCooldown(id, msg, defaultMs = 6 * 60 * 1000) {
+  // Honour "try again in 6m2s" if present, else use the default.
   const m = /try again in\s+(?:(\d+)m)?\s*([\d.]+)s/i.exec(msg || '')
-  let ms = 6 * 60 * 1000
+  let ms = defaultMs
   if (m) ms = ((Number(m[1]) || 0) * 60 + Math.ceil(Number(m[2]) || 0)) * 1000 + 2000
   _cooldown.set(id, Date.now() + Math.min(ms, 60 * 60 * 1000))
 }
@@ -265,6 +265,7 @@ export async function completeStream(messages, opts = {}, onToken = () => {}) {
       errors.push(`${name}: empty`)
     } catch (e) {
       if (isDailyLimit(e.message)) parkCooldown(id, e.message)
+      else if (isModelError(0, e.message)) parkCooldown(id, e.message, 30 * 60 * 1000)
       console.warn('LLM stream attempt failed:', `${name}: ${e.message}`)
       errors.push(`${name}: ${e.message}`)
     }
@@ -287,7 +288,11 @@ export async function complete(messages, opts = {}) {
     all.push({ id: `cerebras:${key}`, name: `cerebras#${CEREBRAS_KEYS.indexOf(key) + 1}`, fn: () => cerebrasComplete(key, messages, opts) })
   for (const key of rotate(OPENROUTER_KEYS))
     all.push({ id: `openrouter:${key}`, name: `openrouter#${OPENROUTER_KEYS.indexOf(key) + 1}`, fn: () => openRouterComplete(key, messages, opts) })
-  if (process.env.GEMINI_API_KEY && process.env.GEMINI_ENABLED === 'true')
+  // Gemini is now ON by default whenever a key exists (set GEMINI_ENABLED=false
+  // to disable). Google's free tier is far more generous than Groq's per-minute
+  // cap, so this is real, reliable capacity — used as a fallback after the fast
+  // OpenAI-compatible providers.
+  if (process.env.GEMINI_API_KEY && process.env.GEMINI_ENABLED !== 'false')
     all.push({ id: 'gemini', name: 'gemini', fn: () => geminiComplete(messages, opts) })
   if (process.env.OLLAMA_BASE_URL || process.env.OLLAMA_MODEL)
     all.push({ id: 'ollama', name: 'ollama', fn: () => ollamaComplete(messages, opts) })
@@ -309,7 +314,8 @@ export async function complete(messages, opts = {}) {
     } catch (e) {
       console.warn('LLM attempt failed:', `${name}: ${e.message}`)
       errors.push(`${name}: ${e.message}`)
-      if (isDailyLimit(e.message)) parkCooldown(id, e.message) // skip this key for a while
+      if (isDailyLimit(e.message)) parkCooldown(id, e.message) // exhausted → skip a while
+      else if (isModelError(0, e.message)) parkCooldown(id, e.message, 30 * 60 * 1000) // no model access → skip 30m
     }
   }
   throw new Error('All LLM attempts failed → ' + errors.join(' | '))
