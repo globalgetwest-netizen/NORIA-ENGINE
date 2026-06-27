@@ -40,7 +40,7 @@ app.use(
 const hits = new Map()
 const WINDOW_MS = 60_000
 const MAX_PER_WINDOW = Number(process.env.RATE_LIMIT_PER_MIN) || 200
-const RATE_EXEMPT = new Set(['/health', '/v1/test-llm', '/v1/test-cerebras', '/v1/feedback', '/v1/cache-stats'])
+const RATE_EXEMPT = new Set(['/health', '/v1/test-llm', '/v1/test-cerebras', '/v1/feedback', '/v1/cache-stats', '/v1/test-search'])
 app.use((req, res, next) => {
   if (RATE_EXEMPT.has(req.path)) return next()
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown'
@@ -155,6 +155,29 @@ app.get('/v1/test-cerebras', async (req, res) => {
     hint: 'If availableModels lists model ids, set CEREBRAS_MODEL in Render to one of them. If httpStatus is 401, the key is invalid. If 403/empty, the account lacks inference access.',
     keys: out,
   })
+})
+
+// ── Live-search diagnostic ────────────────────────────────────────────────────
+// Open in a browser: /v1/test-search?secret=YOUR_SECRET (optional &q=...)
+// Shows which search providers your keys enable, and a live sample result.
+app.get('/v1/test-search', async (req, res) => {
+  const secret = process.env.NORIA_SETUP_SECRET
+  if (secret && req.query.secret !== secret) return res.status(401).send('Unauthorized — add ?secret=YOUR_NORIA_SETUP_SECRET')
+  try {
+    const { searchProviders, webSearch, needsLiveSearch } = await import('./searcher.js')
+    const q = req.query.q ? String(req.query.q) : 'current price of bitcoin today'
+    const results = await webSearch(q)
+    res.json({
+      query: q,
+      triggersLiveSearch: needsLiveSearch(q),
+      providersConfigured: searchProviders(),
+      resultCount: results.length,
+      results: results.slice(0, 4),
+      hint: 'If providersConfigured shows all false except duckduckgo, your API keys are set under different env-var names. If resultCount is 0, the search returned nothing for this query.',
+    })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
 })
 
 // ── Cache stats ───────────────────────────────────────────────────────────────
