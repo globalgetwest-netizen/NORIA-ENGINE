@@ -121,8 +121,8 @@ async function groqComplete(key, messages, opts = {}) {
 
 async function cerebrasComplete(key, messages, opts = {}) {
   const models = [
-    process.env.CEREBRAS_MODEL || 'llama-3.3-70b',
-    process.env.CEREBRAS_FALLBACK_MODEL || 'llama3.1-8b',
+    process.env.CEREBRAS_MODEL || 'gpt-oss-120b',
+    process.env.CEREBRAS_FALLBACK_MODEL || 'zai-glm-4.7',
   ]
   return openAICompatible({ url: 'https://api.cerebras.ai/v1/chat/completions', key, models, messages, opts })
 }
@@ -251,7 +251,7 @@ export async function completeStream(messages, opts = {}, onToken = () => {}) {
   for (const key of rotate(GROQ_KEYS))
     all.push({ id: `groq:${key}`, name: `groq#${GROQ_KEYS.indexOf(key) + 1}`, fn: () => openAICompatibleStream({ url: 'https://api.groq.com/openai/v1/chat/completions', key, models: [process.env.GROQ_MODEL || 'llama-3.3-70b-versatile', process.env.GROQ_FALLBACK_MODEL || 'llama-3.1-8b-instant'], messages, opts }, onToken) })
   for (const key of rotate(CEREBRAS_KEYS))
-    all.push({ id: `cerebras:${key}`, name: `cerebras#${CEREBRAS_KEYS.indexOf(key) + 1}`, fn: () => openAICompatibleStream({ url: 'https://api.cerebras.ai/v1/chat/completions', key, models: [process.env.CEREBRAS_MODEL || 'llama-3.3-70b', process.env.CEREBRAS_FALLBACK_MODEL || 'llama3.1-8b'], messages, opts }, onToken) })
+    all.push({ id: `cerebras:${key}`, name: `cerebras#${CEREBRAS_KEYS.indexOf(key) + 1}`, fn: () => openAICompatibleStream({ url: 'https://api.cerebras.ai/v1/chat/completions', key, models: [process.env.CEREBRAS_MODEL || 'gpt-oss-120b', process.env.CEREBRAS_FALLBACK_MODEL || 'zai-glm-4.7'], messages, opts }, onToken) })
   for (const key of rotate(OPENROUTER_KEYS))
     all.push({ id: `openrouter:${key}`, name: `openrouter#${OPENROUTER_KEYS.indexOf(key) + 1}`, fn: () => openAICompatibleStream({ url: 'https://openrouter.ai/api/v1/chat/completions', key, models: [process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free', process.env.OPENROUTER_FALLBACK_MODEL || 'meta-llama/llama-3.2-3b-instruct:free'], messages, opts, extraHeaders: { 'HTTP-Referer': process.env.OPENROUTER_REFERER || 'https://noria-engine.onrender.com', 'X-Title': process.env.OPENROUTER_TITLE || 'Noria' } }, onToken) })
 
