@@ -191,11 +191,30 @@ async function duckduckgoLookup(query) {
 }
 
 // ── General web search (the ChatGPT-style live results) ──────────────────────
-// Preferred: a free search API key (Tavily/Serper) if the user has set one —
-// most reliable and returns a synthesised live answer. Fallback: keyless
-// DuckDuckGo HTML, which needs no signup at all. Either way: real current data.
+// Tries every provider you have a key for, in order: Tavily → Serper →
+// Google CSE → keyless DuckDuckGo. Reads several common env-var names for each
+// so your existing keys are picked up regardless of exact naming.
+function envAny(...names) {
+  for (const n of names) { const v = process.env[n]; if (v && String(v).trim()) return String(v).trim() }
+  return ''
+}
+const TAVILY_KEY = () => envAny('SEARCH_API_KEY', 'TAVILY_API_KEY', 'TAVILY_KEY', 'TAVILY')
+const SERPER_KEY = () => envAny('SERPER_API_KEY', 'SERPER_KEY', 'SERPER')
+const GOOGLE_KEY = () => envAny('GOOGLE_SEARCH_KEY', 'GOOGLE_SEARCH_API_KEY', 'GOOGLE_CSE_KEY', 'GOOGLE_API_KEY')
+const GOOGLE_CX = () => envAny('GOOGLE_SEARCH_CX', 'GOOGLE_CX', 'GOOGLE_CSE_CX', 'GOOGLE_CSE_ID', 'GOOGLE_SEARCH_CSE', 'CX')
+
+// Which providers are configured (booleans only — never the key values).
+export function searchProviders() {
+  return {
+    tavily: !!TAVILY_KEY(),
+    serper: !!SERPER_KEY(),
+    googleCse: !!(GOOGLE_KEY() && GOOGLE_CX()),
+    duckduckgo: true, // always available (keyless)
+  }
+}
+
 async function tavilySearch(query) {
-  const key = process.env.SEARCH_API_KEY || process.env.TAVILY_API_KEY
+  const key = TAVILY_KEY()
   if (!key) return null
   const data = await fetchJSON('https://api.tavily.com/search', {
     method: 'POST',
@@ -207,6 +226,38 @@ async function tavilySearch(query) {
   if (data.answer) rows.push({ kind: 'web', title: 'Live web answer', snippet: String(data.answer), url: '' })
   for (const r of (data.results || []).slice(0, 3)) {
     if (r?.content) rows.push({ kind: 'web', title: r.title || 'Web result', snippet: String(r.content).slice(0, 400), url: r.url || '' })
+  }
+  return rows.length ? rows : null
+}
+
+async function serperSearch(query) {
+  const key = SERPER_KEY()
+  if (!key) return null
+  const data = await fetchJSON('https://google.serper.dev/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-KEY': key },
+    body: JSON.stringify({ q: query, num: 5 }),
+  })
+  if (!data) return null
+  const rows = []
+  const ab = data.answerBox
+  if (ab) rows.push({ kind: 'web', title: ab.title || 'Answer', snippet: ab.answer || ab.snippet || '', url: ab.link || '' })
+  if (data.knowledgeGraph?.description) rows.push({ kind: 'web', title: data.knowledgeGraph.title || 'Info', snippet: data.knowledgeGraph.description, url: '' })
+  for (const r of (data.organic || []).slice(0, 3)) rows.push({ kind: 'web', title: r.title || 'Web result', snippet: r.snippet || '', url: r.link || '' })
+  const out = rows.filter((r) => r.snippet)
+  return out.length ? out : null
+}
+
+async function googleCseSearch(query) {
+  const key = GOOGLE_KEY(), cx = GOOGLE_CX()
+  if (!key || !cx) return null
+  const data = await fetchJSON(
+    `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(key)}&cx=${encodeURIComponent(cx)}&num=4&q=${encodeURIComponent(query)}`
+  )
+  if (!data) return null
+  const rows = []
+  for (const it of (data.items || []).slice(0, 4)) {
+    if (it?.snippet) rows.push({ kind: 'web', title: it.title || 'Web result', snippet: it.snippet, url: it.link || '' })
   }
   return rows.length ? rows : null
 }
@@ -240,8 +291,17 @@ async function duckduckgoHtmlSearch(query) {
   }
 }
 
+// Provider order favours free longevity: Tavily (monthly) → Google CSE (daily)
+// → keyless DuckDuckGo (unlimited) → Serper LAST (one-time credit, preserved as
+// a reserve so it isn't burned early). Each is skipped if it returns nothing.
 async function generalWebSearch(query) {
-  return (await tavilySearch(query)) || (await duckduckgoHtmlSearch(query)) || []
+  return (
+    (await tavilySearch(query)) ||
+    (await googleCseSearch(query)) ||
+    (await duckduckgoHtmlSearch(query)) ||
+    (await serperSearch(query)) ||
+    []
+  )
 }
 
 // ── Orchestrator ─────────────────────────────────────────────────────────────
