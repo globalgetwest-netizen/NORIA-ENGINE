@@ -30,6 +30,26 @@ function detectInjection(query) {
   return INJECTION_PATTERNS.some((p) => p.test(query))
 }
 
+// Adaptive output budget. Reserving a huge max_tokens on EVERY request blows the
+// providers' tight per-minute token limits (e.g. Groq free TPM = 6000), which
+// causes 429s and the delay/"hang" on the next request. So we only request a
+// large budget when the user actually wants a long document; normal questions
+// get a modest budget, which lets far more requests through per minute.
+const DOC_RE = /\b(cv|résumé|resume|cover letter|business plan|proposal|report|contract|agreement|essay|letter|document|memo|policy|plan|blueprint|full|detailed|comprehensive|in[\s-]?depth|step[\s-]?by[\s-]?step|complete)\b/i
+function outputBudget(query) {
+  return DOC_RE.test(query || '') ? 3000 : 1024
+}
+
+// Adaptive temperature for accuracy. Factual questions get a LOW temperature so
+// the model sticks to what it knows instead of inventing; creative tasks get a
+// warmer temperature for richer, more varied writing.
+const CREATIVE_RE = /\b(poem|poetry|story|short story|song|lyrics|rap|joke|riddle|brainstorm|imagine|creative|slogan|tagline|name ideas|caption|fiction|screenplay|dialogue)\b/i
+function temperatureFor(query) {
+  if (CREATIVE_RE.test(query || '')) return 0.6 // creative → varied
+  if (DOC_RE.test(query || '')) return 0.35 // documents → professional, slight flexibility
+  return 0.2 // factual/general → precise, minimises hallucination
+}
+
 export async function ask(query, historyMessages = [], system = '') {
   const start = Date.now()
 
@@ -95,9 +115,7 @@ export async function ask(query, historyMessages = [], system = '') {
   let provider = activeProvider()
   let llmError = null
   try {
-    // maxTokens raised to 4000 so full documents (CVs, business plans,
-    // reports, contracts) are never truncated mid-page.
-    answer = await complete(messages, { maxTokens: 4000, temperature: 0.4 })
+    answer = await complete(messages, { maxTokens: outputBudget(query), temperature: temperatureFor(query) })
   } catch (e) {
     console.error('NORIA LLM error:', e.message)
     llmError = e.message
@@ -186,7 +204,7 @@ export async function askStream(query, historyMessages = [], system = '', onToke
   let provider = activeProvider()
   let llmError = null
   try {
-    answer = await completeStream(messages, { maxTokens: 4000, temperature: 0.4 }, onToken)
+    answer = await completeStream(messages, { maxTokens: outputBudget(query), temperature: temperatureFor(query) }, onToken)
   } catch (e) {
     console.error('NORIA LLM stream error:', e.message)
     llmError = e.message
