@@ -44,6 +44,25 @@ function rotate(arr) {
 }
 
 const isTokenLimit = (s) => /tokens per day|TPD|tokens per minute|TPM|rate.?limit|RESOURCE_EXHAUSTED|\b429\b/i.test(s)
+// Model unavailable: wrong/renamed slug, gated (no access), or no-longer-free.
+// On these we should try the NEXT model on the same key, not abandon the key.
+const isModelError = (status, s) =>
+  status === 404 ||
+  /does not exist|do not have access|not found|model_not_found|unavailable for free|no endpoints|not available|decommissioned|invalid model/i.test(s)
+// A daily-quota exhaustion (tokens-per-day) — distinct from a short per-minute
+// limit. When a key hits its DAILY cap there's no point re-hitting it for a
+// while, so we park it on a cooldown and skip it (avoids wasted round-trips and
+// the latency they add to every later request).
+const isDailyLimit = (s) => /tokens per day|TPD|per day|RESOURCE_EXHAUSTED|quota/i.test(s)
+const _cooldown = new Map() // id -> epoch ms until which to skip this key
+const onCooldown = (id) => { const t = _cooldown.get(id); return t && Date.now() < t }
+function parkCooldown(id, msg) {
+  // Honour "try again in 6m2s" if present, else default 6 minutes.
+  const m = /try again in\s+(?:(\d+)m)?\s*([\d.]+)s/i.exec(msg || '')
+  let ms = 6 * 60 * 1000
+  if (m) ms = ((Number(m[1]) || 0) * 60 + Math.ceil(Number(m[2]) || 0)) * 1000 + 2000
+  _cooldown.set(id, Date.now() + Math.min(ms, 60 * 60 * 1000))
+}
 // Context-window / payload-too-large errors (e.g. Cerebras free tier = 8192 tokens).
 // These are NOT quota errors — retrying the same request won't help, but a smaller
 // output budget might let it through, so we handle them distinctly.
@@ -82,6 +101,9 @@ async function openAICompatible({ url, key, models, messages, opts, extraHeaders
       if (isContextError(errText) && maxTokens !== 1500) continue
       // Token-limit → move to the next (cheaper/higher-quota) model on this key.
       if (res.status === 429 && isTokenLimit(errText)) break
+      // Model missing / not accessible / no-longer-free → try the NEXT model on
+      // this key (e.g. fall from a gated 70B to a working 8B) instead of dying.
+      if (isModelError(res.status, errText)) break
       // Any other error → stop trying models on this key (caller fails over).
       throw new Error(lastErr)
     }
@@ -108,7 +130,7 @@ async function cerebrasComplete(key, messages, opts = {}) {
 async function openRouterComplete(key, messages, opts = {}) {
   const models = [
     process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free',
-    process.env.OPENROUTER_FALLBACK_MODEL || 'meta-llama/llama-3.1-8b-instruct:free',
+    process.env.OPENROUTER_FALLBACK_MODEL || 'meta-llama/llama-3.2-3b-instruct:free',
   ]
   // OpenRouter recommends these headers for free-tier identification/ranking.
   const extraHeaders = {
@@ -186,7 +208,8 @@ async function openAICompatibleStream({ url, key, models, messages, opts, extraH
     if (!res.ok) {
       const errText = await res.text()
       lastErr = `${model} ${res.status}: ${errText}`
-      if (res.status === 429 && isTokenLimit(errText)) break // next model on this key
+      if (res.status === 429 && isTokenLimit(errText)) continue // next model on this key
+      if (isModelError(res.status, errText)) continue // gated/renamed model → next model
       throw new Error(lastErr) // other error → caller fails over to next key/provider
     }
     // Stream the body. From here we are committed to this attempt.
@@ -224,21 +247,24 @@ async function openAICompatibleStream({ url, key, models, messages, opts, extraH
 }
 
 export async function completeStream(messages, opts = {}, onToken = () => {}) {
-  const attempts = []
+  const all = []
   for (const key of rotate(GROQ_KEYS))
-    attempts.push({ name: `groq#${GROQ_KEYS.indexOf(key) + 1}`, fn: () => openAICompatibleStream({ url: 'https://api.groq.com/openai/v1/chat/completions', key, models: [process.env.GROQ_MODEL || 'llama-3.3-70b-versatile', process.env.GROQ_FALLBACK_MODEL || 'llama-3.1-8b-instant'], messages, opts }, onToken) })
+    all.push({ id: `groq:${key}`, name: `groq#${GROQ_KEYS.indexOf(key) + 1}`, fn: () => openAICompatibleStream({ url: 'https://api.groq.com/openai/v1/chat/completions', key, models: [process.env.GROQ_MODEL || 'llama-3.3-70b-versatile', process.env.GROQ_FALLBACK_MODEL || 'llama-3.1-8b-instant'], messages, opts }, onToken) })
   for (const key of rotate(CEREBRAS_KEYS))
-    attempts.push({ name: `cerebras#${CEREBRAS_KEYS.indexOf(key) + 1}`, fn: () => openAICompatibleStream({ url: 'https://api.cerebras.ai/v1/chat/completions', key, models: [process.env.CEREBRAS_MODEL || 'llama-3.3-70b', process.env.CEREBRAS_FALLBACK_MODEL || 'llama3.1-8b'], messages, opts }, onToken) })
+    all.push({ id: `cerebras:${key}`, name: `cerebras#${CEREBRAS_KEYS.indexOf(key) + 1}`, fn: () => openAICompatibleStream({ url: 'https://api.cerebras.ai/v1/chat/completions', key, models: [process.env.CEREBRAS_MODEL || 'llama-3.3-70b', process.env.CEREBRAS_FALLBACK_MODEL || 'llama3.1-8b'], messages, opts }, onToken) })
   for (const key of rotate(OPENROUTER_KEYS))
-    attempts.push({ name: `openrouter#${OPENROUTER_KEYS.indexOf(key) + 1}`, fn: () => openAICompatibleStream({ url: 'https://openrouter.ai/api/v1/chat/completions', key, models: [process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free', process.env.OPENROUTER_FALLBACK_MODEL || 'meta-llama/llama-3.1-8b-instruct:free'], messages, opts, extraHeaders: { 'HTTP-Referer': process.env.OPENROUTER_REFERER || 'https://noria-engine.onrender.com', 'X-Title': process.env.OPENROUTER_TITLE || 'Noria' } }, onToken) })
+    all.push({ id: `openrouter:${key}`, name: `openrouter#${OPENROUTER_KEYS.indexOf(key) + 1}`, fn: () => openAICompatibleStream({ url: 'https://openrouter.ai/api/v1/chat/completions', key, models: [process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free', process.env.OPENROUTER_FALLBACK_MODEL || 'meta-llama/llama-3.2-3b-instruct:free'], messages, opts, extraHeaders: { 'HTTP-Referer': process.env.OPENROUTER_REFERER || 'https://noria-engine.onrender.com', 'X-Title': process.env.OPENROUTER_TITLE || 'Noria' } }, onToken) })
 
+  const live = all.filter((a) => !onCooldown(a.id))
+  const queue = live.length ? live : all
   const errors = []
-  for (const { name, fn } of attempts) {
+  for (const { id, name, fn } of queue) {
     try {
       const text = await fn()
       if (text?.trim()) return text.trim()
       errors.push(`${name}: empty`)
     } catch (e) {
+      if (isDailyLimit(e.message)) parkCooldown(id, e.message)
       console.warn('LLM stream attempt failed:', `${name}: ${e.message}`)
       errors.push(`${name}: ${e.message}`)
     }
@@ -254,23 +280,28 @@ export async function complete(messages, opts = {}) {
   // Build the ordered list of attempts: every Groq key, then every Cerebras key,
   // then every OpenRouter key, then optional Gemini, then optional Ollama.
   // Keys are rotated for load spread.
-  const attempts = []
+  const all = []
   for (const key of rotate(GROQ_KEYS))
-    attempts.push({ name: `groq#${GROQ_KEYS.indexOf(key) + 1}`, fn: () => groqComplete(key, messages, opts) })
+    all.push({ id: `groq:${key}`, name: `groq#${GROQ_KEYS.indexOf(key) + 1}`, fn: () => groqComplete(key, messages, opts) })
   for (const key of rotate(CEREBRAS_KEYS))
-    attempts.push({ name: `cerebras#${CEREBRAS_KEYS.indexOf(key) + 1}`, fn: () => cerebrasComplete(key, messages, opts) })
+    all.push({ id: `cerebras:${key}`, name: `cerebras#${CEREBRAS_KEYS.indexOf(key) + 1}`, fn: () => cerebrasComplete(key, messages, opts) })
   for (const key of rotate(OPENROUTER_KEYS))
-    attempts.push({ name: `openrouter#${OPENROUTER_KEYS.indexOf(key) + 1}`, fn: () => openRouterComplete(key, messages, opts) })
+    all.push({ id: `openrouter:${key}`, name: `openrouter#${OPENROUTER_KEYS.indexOf(key) + 1}`, fn: () => openRouterComplete(key, messages, opts) })
   if (process.env.GEMINI_API_KEY && process.env.GEMINI_ENABLED === 'true')
-    attempts.push({ name: 'gemini', fn: () => geminiComplete(messages, opts) })
+    all.push({ id: 'gemini', name: 'gemini', fn: () => geminiComplete(messages, opts) })
   if (process.env.OLLAMA_BASE_URL || process.env.OLLAMA_MODEL)
-    attempts.push({ name: 'ollama', fn: () => ollamaComplete(messages, opts) })
+    all.push({ id: 'ollama', name: 'ollama', fn: () => ollamaComplete(messages, opts) })
 
-  if (attempts.length === 0)
+  if (all.length === 0)
     throw new Error('No LLM provider configured. Set GROQ_API_KEY(S), CEREBRAS_API_KEY(S), OPENROUTER_API_KEY(S), GEMINI_API_KEY, or OLLAMA_BASE_URL.')
 
+  // Skip keys parked on a daily-limit cooldown — but if that would skip
+  // everything, fall back to trying them all (better to attempt than refuse).
+  const attempts = all.filter((a) => !onCooldown(a.id))
+  const queue = attempts.length ? attempts : all
+
   const errors = []
-  for (const { name, fn } of attempts) {
+  for (const { id, name, fn } of queue) {
     try {
       const text = await fn()
       if (text?.trim()) return text.trim()
@@ -278,8 +309,7 @@ export async function complete(messages, opts = {}) {
     } catch (e) {
       console.warn('LLM attempt failed:', `${name}: ${e.message}`)
       errors.push(`${name}: ${e.message}`)
-      // On a token limit, move straight to the next key/provider (no wait).
-      // On other errors, also continue to the next attempt.
+      if (isDailyLimit(e.message)) parkCooldown(id, e.message) // skip this key for a while
     }
   }
   throw new Error('All LLM attempts failed → ' + errors.join(' | '))
