@@ -59,6 +59,12 @@ const LIVE_PATTERNS = [
   /\b(score|scores|results?|final score|who won|winner|standings|fixtures?)\b/i,
   /\bhow much (is|are|does|do)\b/i,
   /\b20(2[4-9]|[3-9]\d)\b/, // 2024 and later
+  // Factual lookups that benefit from grounding (improves accuracy):
+  /\bhow many\b/i,
+  /\b(population|capital|gdp|area|distance|height|length|net worth|salary|founded|established|launched|released)\b/i,
+  /\b(when (is|was|did|will)|what year|what date|release date|deadline)\b/i,
+  /\b(ceo|founder|owner|director|minister|senator|governor) of\b/i,
+  /\b(statistics|stats|figures|data|ranking|rankings|record)\b/i,
   // bare currency pair, e.g. "USD to EUR", "GBP/NGN", "EUR = USD"
   /\b(USD|EUR|GBP|JPY|CNY|CHF|CAD|AUD|NZD|INR|NGN|GHS|ZAR|KES|EGP|AED|SAR|BRL|RUB|TRY|SEK|NOK|DKK|PLN|MXN|SGD|HKD|KRW)\b\s*(?:to|in|vs|=|\/)?\s*\b(USD|EUR|GBP|JPY|CNY|CHF|CAD|AUD|NZD|INR|NGN|GHS|ZAR|KES|EGP|AED|SAR|BRL|RUB|TRY|SEK|NOK|DKK|PLN|MXN|SGD|HKD|KRW)\b/i,
 ]
