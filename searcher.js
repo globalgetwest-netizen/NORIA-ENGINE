@@ -67,6 +67,7 @@ const LIVE_PATTERNS = [
   /\b(statistics|stats|figures|data|ranking|rankings|record)\b/i,
   /\b(current|latest|today'?s?)\s+(price|news|events?|affairs|rate|score|situation|status|version)\b/i,
   /\b(what'?s happening|trending|breaking news|live)\b/i,
+  /\b(current\s+time|what\s+time|time\s+(?:right\s+)?now|time\s+in|current\s+date|today'?s?\s+date|what\s+day\s+is)\b/i,
   // bare currency pair, e.g. "USD to EUR", "GBP/NGN", "EUR = USD"
   /\b(USD|EUR|GBP|JPY|CNY|CHF|CAD|AUD|NZD|INR|NGN|GHS|ZAR|KES|EGP|AED|SAR|BRL|RUB|TRY|SEK|NOK|DKK|PLN|MXN|SGD|HKD|KRW)\b\s*(?:to|in|vs|=|\/)?\s*\b(USD|EUR|GBP|JPY|CNY|CHF|CAD|AUD|NZD|INR|NGN|GHS|ZAR|KES|EGP|AED|SAR|BRL|RUB|TRY|SEK|NOK|DKK|PLN|MXN|SGD|HKD|KRW)\b/i,
   // Broad real-world / world-knowledge questions (people, places, orgs, events,
@@ -140,6 +141,57 @@ async function cryptoLookup(query) {
     title: `${hit.toUpperCase()} price`,
     snippet: `${id} is currently $${row.usd.toLocaleString('en-US')} USD${chg}.`,
     url: 'https://www.coingecko.com',
+  }
+}
+
+// ── Current time / date (authoritative — from the server clock, never the web)
+// Web snippets for "current time" are stale (indexed days ago). The real clock
+// is the server's own Date + the correct timezone, computed instantly & free.
+const TZ_MAP = {
+  ghana: 'Africa/Accra', nigeria: 'Africa/Lagos', kenya: 'Africa/Nairobi', tanzania: 'Africa/Dar_es_Salaam',
+  uganda: 'Africa/Kampala', 'south africa': 'Africa/Johannesburg', egypt: 'Africa/Cairo', morocco: 'Africa/Casablanca',
+  ethiopia: 'Africa/Addis_Ababa', senegal: 'Africa/Dakar', 'ivory coast': 'Africa/Abidjan', cameroon: 'Africa/Douala',
+  uk: 'Europe/London', 'united kingdom': 'Europe/London', london: 'Europe/London', ireland: 'Europe/Dublin',
+  france: 'Europe/Paris', germany: 'Europe/Berlin', spain: 'Europe/Madrid', italy: 'Europe/Rome',
+  netherlands: 'Europe/Amsterdam', turkey: 'Europe/Istanbul', russia: 'Europe/Moscow',
+  usa: 'America/New_York', 'united states': 'America/New_York', america: 'America/New_York', 'new york': 'America/New_York',
+  'los angeles': 'America/Los_Angeles', california: 'America/Los_Angeles', chicago: 'America/Chicago',
+  canada: 'America/Toronto', toronto: 'America/Toronto', brazil: 'America/Sao_Paulo', mexico: 'America/Mexico_City',
+  india: 'Asia/Kolkata', pakistan: 'Asia/Karachi', bangladesh: 'Asia/Dhaka', china: 'Asia/Shanghai',
+  japan: 'Asia/Tokyo', korea: 'Asia/Seoul', singapore: 'Asia/Singapore', malaysia: 'Asia/Kuala_Lumpur',
+  indonesia: 'Asia/Jakarta', philippines: 'Asia/Manila', dubai: 'Asia/Dubai', uae: 'Asia/Dubai',
+  'saudi arabia': 'Asia/Riyadh', qatar: 'Asia/Qatar', israel: 'Asia/Jerusalem',
+  australia: 'Australia/Sydney', sydney: 'Australia/Sydney', 'new zealand': 'Pacific/Auckland',
+  // Major cities (so "time in Tokyo" etc. resolve directly)
+  tokyo: 'Asia/Tokyo', beijing: 'Asia/Shanghai', shanghai: 'Asia/Shanghai', 'hong kong': 'Asia/Hong_Kong',
+  paris: 'Europe/Paris', berlin: 'Europe/Berlin', madrid: 'Europe/Madrid', rome: 'Europe/Rome',
+  moscow: 'Europe/Moscow', istanbul: 'Europe/Istanbul', amsterdam: 'Europe/Amsterdam',
+  lagos: 'Africa/Lagos', accra: 'Africa/Accra', nairobi: 'Africa/Nairobi', cairo: 'Africa/Cairo',
+  johannesburg: 'Africa/Johannesburg', casablanca: 'Africa/Casablanca', 'addis ababa': 'Africa/Addis_Ababa',
+  mumbai: 'Asia/Kolkata', delhi: 'Asia/Kolkata', karachi: 'Asia/Karachi', dhaka: 'Asia/Dhaka',
+  jakarta: 'Asia/Jakarta', manila: 'Asia/Manila', seoul: 'Asia/Seoul', bangkok: 'Asia/Bangkok',
+  riyadh: 'Asia/Riyadh', doha: 'Asia/Qatar', jerusalem: 'Asia/Jerusalem',
+}
+function timeLookup(query) {
+  if (!/\b(current\s+time|what(?:'?s| is)?\s+the\s+time|what\s+time\s+is\s+it|time\s+(?:right\s+)?now|time\s+in\b|current\s+date|what(?:'?s| is)?\s+(?:the\s+)?date|today'?s?\s+date|what\s+day\s+is)\b/i.test(query)) {
+    return null
+  }
+  const ql = query.toLowerCase()
+  let tz = 'UTC', label = 'UTC (Greenwich Mean Time)'
+  for (const [name, zone] of Object.entries(TZ_MAP)) {
+    if (ql.includes(name)) { tz = zone; label = name.replace(/\b\w/g, (c) => c.toUpperCase()); break }
+  }
+  let when
+  try {
+    when = new Intl.DateTimeFormat('en-GB', { timeZone: tz, dateStyle: 'full', timeStyle: 'long' }).format(new Date())
+  } catch (_) {
+    when = new Date().toUTCString(); tz = 'UTC'; label = 'UTC'
+  }
+  return {
+    kind: 'time',
+    title: `Current date & time — ${label}`,
+    snippet: `Right now it is ${when} (timezone ${tz}). This is the exact, real-time current date and time.`,
+    url: '',
   }
 }
 
@@ -330,6 +382,10 @@ async function generalWebSearch(query) {
 // ── Orchestrator ─────────────────────────────────────────────────────────────
 export async function webSearch(query) {
   if (!query) return []
+  // Time/date is answered authoritatively from the server clock — never the web
+  // (web snippets are stale). Return it alone so nothing can contradict it.
+  const timeRes = timeLookup(query)
+  if (timeRes) return [timeRes]
   // Run structured lookups (fast, exact) and general lookups in parallel, but
   // never let the whole thing exceed the deadline — if it does, we return what
   // we can and Noria answers from her own knowledge (no hanging on the user).
