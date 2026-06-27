@@ -20,6 +20,17 @@ import { setupSchema } from './vectorstore.js'
 import { seedKnowledge } from './ingest.js'
 import { activeProvider } from './llm.js'
 
+// ── Crash guards — the engine is the core; it must NEVER die from a stray error.
+// A single unhandled promise rejection or background exception would otherwise
+// kill the whole Node process and take every user down until a cold restart.
+// We log them and keep serving. (Per-request errors are still caught per-route.)
+process.on('unhandledRejection', (reason) => {
+  console.error('UNHANDLED REJECTION (kept alive):', reason)
+})
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION (kept alive):', err)
+})
+
 const app = express()
 app.use(express.json({ limit: '1mb' }))
 
@@ -314,27 +325,37 @@ app.post('/v1/ask/stream', async (req, res) => {
   res.setHeader('Content-Encoding', 'identity') // never gzip — compression buffers SSE
   if (res.flushHeaders) res.flushHeaders()
 
+  // Stop all work the moment the client disconnects (closed tab / lost network),
+  // so we never write to a dead socket or keep a heartbeat running forever.
+  let closed = false
+  const stop = () => { closed = true; clearInterval(heartbeat) }
+  res.on('close', stop)
+
   const send = (obj) => {
-    res.write(`data: ${JSON.stringify(obj)}\n\n`)
-    if (typeof res.flush === 'function') res.flush() // push bytes out immediately
+    if (closed) return
+    try {
+      res.write(`data: ${JSON.stringify(obj)}\n\n`)
+      if (typeof res.flush === 'function') res.flush() // push bytes out immediately
+    } catch (_) { closed = true }
   }
 
   // Prime the connection right away + a heartbeat so proxies don't buffer and
   // the client's first-token watchdog sees activity immediately.
-  res.write(': open\n\n')
-  if (typeof res.flush === 'function') res.flush()
-  const heartbeat = setInterval(() => { try { res.write(': hb\n\n'); if (res.flush) res.flush() } catch (_) {} }, 15000)
+  try { res.write(': open\n\n'); if (res.flush) res.flush() } catch (_) {}
+  const heartbeat = setInterval(() => {
+    if (closed) return
+    try { res.write(': hb\n\n'); if (res.flush) res.flush() } catch (_) { stop() }
+  }, 15000)
 
   try {
     const result = await askStream(query, history, system, (token) => send({ token }))
     send({ done: true, sources: result.sources || [], provider: result.provider })
-    clearInterval(heartbeat)
-    res.end()
   } catch (e) {
-    clearInterval(heartbeat)
     console.error('/v1/ask/stream error:', e)
     send({ error: true, answer: 'Noria is momentarily unavailable. Please try again in a few seconds.' })
-    res.end()
+  } finally {
+    stop()
+    if (!res.writableEnded) { try { res.end() } catch (_) {} }
   }
 })
 
@@ -384,6 +405,19 @@ app.get('/v1/setup', async (req, res) => {
     console.error('/v1/setup (GET) error:', e)
     res.status(500).send('Setup failed: ' + e.message)
   }
+})
+
+// ── Unknown routes → clean JSON (never an unhandled crash) ───────────────────
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found', path: req.path })
+})
+
+// ── Global error handler — last line of defence; always responds, never dies ──
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  console.error('Express error handler:', err)
+  if (res.headersSent) return
+  res.status(500).json({ error: 'Internal server error' })
 })
 
 const PORT = process.env.PORT || 4000
