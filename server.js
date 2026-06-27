@@ -40,7 +40,7 @@ app.use(
 const hits = new Map()
 const WINDOW_MS = 60_000
 const MAX_PER_WINDOW = Number(process.env.RATE_LIMIT_PER_MIN) || 200
-const RATE_EXEMPT = new Set(['/health', '/v1/test-llm', '/v1/test-cerebras', '/v1/feedback'])
+const RATE_EXEMPT = new Set(['/health', '/v1/test-llm', '/v1/test-cerebras', '/v1/feedback', '/v1/cache-stats'])
 app.use((req, res, next) => {
   if (RATE_EXEMPT.has(req.path)) return next()
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown'
@@ -155,6 +155,18 @@ app.get('/v1/test-cerebras', async (req, res) => {
     hint: 'If availableModels lists model ids, set CEREBRAS_MODEL in Render to one of them. If httpStatus is 401, the key is invalid. If 403/empty, the account lacks inference access.',
     keys: out,
   })
+})
+
+// ── Cache stats ───────────────────────────────────────────────────────────────
+// Open in a browser: /v1/cache-stats  → shows how many answers are cached and
+// the hit rate (higher hit rate = more free capacity + faster responses).
+app.get('/v1/cache-stats', async (req, res) => {
+  try {
+    const { cacheStats } = await import('./cache.js')
+    res.json(cacheStats())
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
 })
 
 // ── Health ────────────────────────────────────────────────────────────────────
