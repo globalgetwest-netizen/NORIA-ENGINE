@@ -40,7 +40,7 @@ app.use(
 const hits = new Map()
 const WINDOW_MS = 60_000
 const MAX_PER_WINDOW = Number(process.env.RATE_LIMIT_PER_MIN) || 200
-const RATE_EXEMPT = new Set(['/health', '/v1/test-llm'])
+const RATE_EXEMPT = new Set(['/health', '/v1/test-llm', '/v1/test-cerebras'])
 app.use((req, res, next) => {
   if (RATE_EXEMPT.has(req.path)) return next()
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown'
@@ -96,6 +96,36 @@ app.get('/v1/test-llm', async (req, res) => {
     results.ask = { ok: false, error: e.message }
   }
   res.json(results)
+})
+
+// ── Cerebras key/model diagnostic ─────────────────────────────────────────────
+// Open in a browser: /v1/test-cerebras?secret=YOUR_NORIA_SETUP_SECRET
+// For each Cerebras key it asks Cerebras which models that key can actually use,
+// so we know the exact working model name (no guessing). Never exposes the keys.
+app.get('/v1/test-cerebras', async (req, res) => {
+  const secret = process.env.NORIA_SETUP_SECRET
+  if (secret && req.query.secret !== secret) return res.status(401).send('Unauthorized — add ?secret=YOUR_NORIA_SETUP_SECRET')
+  const keys = (process.env.CEREBRAS_API_KEYS || process.env.CEREBRAS_API_KEY || '')
+    .split(',').map((s) => s.trim()).filter(Boolean)
+  if (!keys.length) return res.json({ error: 'No CEREBRAS_API_KEYS / CEREBRAS_API_KEY set' })
+  const out = []
+  for (let i = 0; i < keys.length; i++) {
+    try {
+      const r = await fetch('https://api.cerebras.ai/v1/models', {
+        headers: { Authorization: `Bearer ${keys[i]}` },
+      })
+      const text = await r.text()
+      let models = null
+      try { models = JSON.parse(text)?.data?.map((m) => m.id) } catch (_) {}
+      out.push({ key: `cerebras#${i + 1}`, httpStatus: r.status, availableModels: models || text.slice(0, 300) })
+    } catch (e) {
+      out.push({ key: `cerebras#${i + 1}`, error: e.message })
+    }
+  }
+  res.json({
+    hint: 'If availableModels lists model ids, set CEREBRAS_MODEL in Render to one of them. If httpStatus is 401, the key is invalid. If 403/empty, the account lacks inference access.',
+    keys: out,
+  })
 })
 
 // ── Health ────────────────────────────────────────────────────────────────────
