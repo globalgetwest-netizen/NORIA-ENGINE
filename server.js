@@ -40,7 +40,7 @@ app.use(
 const hits = new Map()
 const WINDOW_MS = 60_000
 const MAX_PER_WINDOW = Number(process.env.RATE_LIMIT_PER_MIN) || 200
-const RATE_EXEMPT = new Set(['/health', '/v1/test-llm', '/v1/test-cerebras'])
+const RATE_EXEMPT = new Set(['/health', '/v1/test-llm', '/v1/test-cerebras', '/v1/feedback'])
 app.use((req, res, next) => {
   if (RATE_EXEMPT.has(req.path)) return next()
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown'
@@ -96,6 +96,35 @@ app.get('/v1/test-llm', async (req, res) => {
     results.ask = { ok: false, error: e.message }
   }
   res.json(results)
+})
+
+// ── Answer feedback (👍/👎) ───────────────────────────────────────────────────
+// The frontend posts a rating per answer. We log it (visible in Render logs,
+// which persist) and keep the recent ones in memory so you can review what users
+// marked inaccurate and ingest corrections. No DB schema change required.
+const feedbackLog = [] // ring buffer, newest last (max 200)
+app.post('/v1/feedback', (req, res) => {
+  const rating = String(req.body?.rating || '')
+  if (rating !== 'up' && rating !== 'down') return res.status(400).json({ error: "rating must be 'up' or 'down'" })
+  const entry = {
+    rating,
+    question: String(req.body?.question || '').slice(0, 2000),
+    answer: String(req.body?.answer || '').slice(0, 2000),
+    at: new Date().toISOString(),
+  }
+  feedbackLog.push(entry)
+  if (feedbackLog.length > 200) feedbackLog.shift()
+  console.log(JSON.stringify({ event: 'noria_feedback', rating, question: entry.question.slice(0, 120) }))
+  res.json({ ok: true })
+})
+// Review recent feedback (esp. the 👎 ones) so you can correct/ingest them.
+// Open in a browser: /v1/feedback?secret=YOUR_SECRET   (add &rating=down to filter)
+app.get('/v1/feedback', (req, res) => {
+  const secret = process.env.NORIA_SETUP_SECRET
+  if (secret && req.query.secret !== secret) return res.status(401).send('Unauthorized — add ?secret=YOUR_NORIA_SETUP_SECRET')
+  const only = req.query.rating
+  const items = only ? feedbackLog.filter((f) => f.rating === only) : feedbackLog
+  res.json({ count: items.length, feedback: items.slice().reverse() })
 })
 
 // ── Cerebras key/model diagnostic ─────────────────────────────────────────────
