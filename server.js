@@ -33,11 +33,16 @@ app.use(
 )
 
 // ── Simple per-IP rate limiter (in-memory) ────────────────────────────────────
+// IMPORTANT: many real users share ONE public IP via carrier-grade NAT (very
+// common on mobile networks worldwide). A strict per-IP cap therefore blocks
+// large groups of legitimate users at once. The cap is kept generous and is the
+// configurable RATE_LIMIT_PER_MIN env var; health/diagnostic paths are exempt.
 const hits = new Map()
 const WINDOW_MS = 60_000
-const MAX_PER_WINDOW = 30
+const MAX_PER_WINDOW = Number(process.env.RATE_LIMIT_PER_MIN) || 200
+const RATE_EXEMPT = new Set(['/health', '/v1/test-llm'])
 app.use((req, res, next) => {
-  if (req.path === '/health') return next()
+  if (RATE_EXEMPT.has(req.path)) return next()
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown'
   const now = Date.now()
   const rec = hits.get(ip) || { count: 0, reset: now + WINDOW_MS }
