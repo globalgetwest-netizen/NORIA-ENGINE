@@ -51,6 +51,24 @@ function temperatureFor(query) {
   return 0.2 // factual/general → precise, minimises hallucination
 }
 
+// Enrich a short/ambiguous follow-up ("what's the price today?") with the most
+// recent user message so the web search has the entity ("Bitcoin price today").
+function buildSearchQuery(query, history) {
+  if (!history || !history.length) return query
+  if ((query || '').length > 40) return query
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].role === 'user' && history[i].content) {
+      return (history[i].content + ' ' + query).slice(0, 300)
+    }
+  }
+  return query
+}
+
+// Instruction injected when the user wants current info but no live data was
+// found — stops the model from confidently inventing a stale figure.
+const NO_LIVE_DATA_NOTE =
+  '\n\n[NO LIVE DATA AVAILABLE for this question. Do NOT state a specific current price, rate, score, statistic, date, or fact from memory — it may be outdated. Tell the user plainly that you cannot access the live figure right now, and suggest a reliable place to check it.]'
+
 // Only cache GENERIC, repeatable answers — never personalised, conversational,
 // time-sensitive, or creative ones (those must be generated fresh each time).
 function isCacheable(query, historyMessages) {
@@ -114,9 +132,11 @@ export async function ask(query, historyMessages = [], system = '') {
 
   let webResults = []
   let webContext = ''
+  let liveWanted = false
   try {
     if (needsLiveSearch(query)) {
-      webResults = await webSearch(query)
+      liveWanted = true
+      webResults = await webSearch(buildSearchQuery(query, historyMessages))
       webContext = formatSearchContext(webResults)
     }
   } catch (e) {
@@ -125,7 +145,9 @@ export async function ask(query, historyMessages = [], system = '') {
     webContext = ''
   }
 
-  const contextBlock = ragContext + webContext
+  // Wanted live data but found none → forbid inventing a stale figure.
+  const liveNote = liveWanted && webResults.length === 0 ? NO_LIVE_DATA_NOTE : ''
+  const contextBlock = ragContext + webContext + liveNote
   const userContent = contextBlock ? `${query}\n\n${contextBlock}` : query
 
   const messages = [
@@ -217,9 +239,11 @@ export async function askStream(query, historyMessages = [], system = '', onToke
 
   let webResults = []
   let webContext = ''
+  let liveWanted = false
   try {
     if (needsLiveSearch(query)) {
-      webResults = await webSearch(query)
+      liveWanted = true
+      webResults = await webSearch(buildSearchQuery(query, historyMessages))
       webContext = formatSearchContext(webResults)
     }
   } catch (e) {
@@ -228,7 +252,9 @@ export async function askStream(query, historyMessages = [], system = '', onToke
     webContext = ''
   }
 
-  const contextBlock = ragContext + webContext
+  // Wanted live data but found none → forbid inventing a stale figure.
+  const liveNote = liveWanted && webResults.length === 0 ? NO_LIVE_DATA_NOTE : ''
+  const contextBlock = ragContext + webContext + liveNote
   const userContent = contextBlock ? `${query}\n\n${contextBlock}` : query
 
   const messages = [
