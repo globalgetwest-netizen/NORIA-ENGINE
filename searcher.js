@@ -65,6 +65,8 @@ const LIVE_PATTERNS = [
   /\b(when (is|was|did|will)|what year|what date|release date|deadline)\b/i,
   /\b(ceo|founder|owner|director|minister|senator|governor) of\b/i,
   /\b(statistics|stats|figures|data|ranking|rankings|record)\b/i,
+  /\b(current|latest|today'?s?)\s+(price|news|events?|affairs|rate|score|situation|status|version)\b/i,
+  /\b(what'?s happening|trending|breaking news|live)\b/i,
   // bare currency pair, e.g. "USD to EUR", "GBP/NGN", "EUR = USD"
   /\b(USD|EUR|GBP|JPY|CNY|CHF|CAD|AUD|NZD|INR|NGN|GHS|ZAR|KES|EGP|AED|SAR|BRL|RUB|TRY|SEK|NOK|DKK|PLN|MXN|SGD|HKD|KRW)\b\s*(?:to|in|vs|=|\/)?\s*\b(USD|EUR|GBP|JPY|CNY|CHF|CAD|AUD|NZD|INR|NGN|GHS|ZAR|KES|EGP|AED|SAR|BRL|RUB|TRY|SEK|NOK|DKK|PLN|MXN|SGD|HKD|KRW)\b/i,
 ]
@@ -188,6 +190,60 @@ async function duckduckgoLookup(query) {
   return rows
 }
 
+// ── General web search (the ChatGPT-style live results) ──────────────────────
+// Preferred: a free search API key (Tavily/Serper) if the user has set one —
+// most reliable and returns a synthesised live answer. Fallback: keyless
+// DuckDuckGo HTML, which needs no signup at all. Either way: real current data.
+async function tavilySearch(query) {
+  const key = process.env.SEARCH_API_KEY || process.env.TAVILY_API_KEY
+  if (!key) return null
+  const data = await fetchJSON('https://api.tavily.com/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ api_key: key, query, max_results: 4, search_depth: 'basic', include_answer: true }),
+  })
+  if (!data) return null
+  const rows = []
+  if (data.answer) rows.push({ kind: 'web', title: 'Live web answer', snippet: String(data.answer), url: '' })
+  for (const r of (data.results || []).slice(0, 3)) {
+    if (r?.content) rows.push({ kind: 'web', title: r.title || 'Web result', snippet: String(r.content).slice(0, 400), url: r.url || '' })
+  }
+  return rows.length ? rows : null
+}
+
+async function duckduckgoHtmlSearch(query) {
+  const ctrl = new AbortController()
+  const to = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS)
+  try {
+    const res = await fetch('https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query), {
+      signal: ctrl.signal,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36' },
+    })
+    if (!res.ok) return null
+    const html = await res.text()
+    const rows = []
+    const re = /class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g
+    let m
+    while ((m = re.exec(html)) && rows.length < 3) {
+      const text = m[1]
+        .replace(/<[^>]+>/g, '')
+        .replace(/&amp;/g, '&').replace(/&#x27;/g, "'").replace(/&quot;/g, '"')
+        .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#x2F;/g, '/')
+        .replace(/\s+/g, ' ').trim()
+      if (text) rows.push({ kind: 'web', title: 'Web result', snippet: text, url: '' })
+    }
+    return rows.length ? rows : null
+  } catch (_) {
+    return null
+  } finally {
+    clearTimeout(to)
+  }
+}
+
+async function generalWebSearch(query) {
+  return (await tavilySearch(query)) || (await duckduckgoHtmlSearch(query)) || []
+}
+
 // ── Orchestrator ─────────────────────────────────────────────────────────────
 export async function webSearch(query) {
   if (!query) return []
@@ -199,6 +255,7 @@ export async function webSearch(query) {
       currencyLookup(query),
       cryptoLookup(query),
       weatherLookup(query),
+      generalWebSearch(query),
       wikipediaLookup(query),
       duckduckgoLookup(query),
     ]),
@@ -219,7 +276,8 @@ export async function webSearch(query) {
   const seen = new Set()
   const unique = []
   for (const r of results) {
-    const key = (r.title || '').toLowerCase().trim()
+    // De-dupe by snippet content (titles can repeat, e.g. "Web result").
+    const key = (r.snippet || r.title || '').toLowerCase().replace(/\s+/g, ' ').slice(0, 80).trim()
     if (key && seen.has(key)) continue
     seen.add(key)
     unique.push(r)
