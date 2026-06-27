@@ -69,12 +69,35 @@ const LIVE_PATTERNS = [
   /\b(what'?s happening|trending|breaking news|live)\b/i,
   // bare currency pair, e.g. "USD to EUR", "GBP/NGN", "EUR = USD"
   /\b(USD|EUR|GBP|JPY|CNY|CHF|CAD|AUD|NZD|INR|NGN|GHS|ZAR|KES|EGP|AED|SAR|BRL|RUB|TRY|SEK|NOK|DKK|PLN|MXN|SGD|HKD|KRW)\b\s*(?:to|in|vs|=|\/)?\s*\b(USD|EUR|GBP|JPY|CNY|CHF|CAD|AUD|NZD|INR|NGN|GHS|ZAR|KES|EGP|AED|SAR|BRL|RUB|TRY|SEK|NOK|DKK|PLN|MXN|SGD|HKD|KRW)\b/i,
+  // Broad real-world / world-knowledge questions (people, places, orgs, events,
+  // quantities) — these benefit from live grounding so Noria stays current and
+  // accurate globally, not just on prices.
+  /\bwho\s+(is|are|was|were|won|leads?|owns?|founded|created|invented|wrote|plays?|runs?|heads?)\b/i,
+  /\bwhen\s+(is|are|was|were|did|does|will|do)\b/i,
+  /\bwhere\s+(is|are|was|were|can|do|does)\b/i,
+  /\bwhich\s+(country|company|team|player|city|year|leader|president)\b/i,
+  /\b(president|prime minister|leader|king|queen|emir|sultan|chancellor|governor|senator|minister|ambassador|ceo|founder|owner|champion|winner|holder)\s+of\b/i,
+  /\b(election|elected|won|winner|champion|trophy|cup|final|match|tournament|olympics|world cup)\b/i,
+  /\b(how (old|tall|big|long|far|fast|rich|wealthy)|net worth|salary|revenue|valuation|market cap)\b/i,
+  /\b(news|update|situation|conflict|war|crisis|disaster|outbreak|policy|sanction|deal|agreement|summit) (in|on|about|for|of)\b/i,
+]
+
+// Clearly TIMELESS / non-searchable requests — answer from the model directly,
+// no web call (saves quota + latency): creative writing, documents, code,
+// translation/editing, definitions of stable concepts, personal advice.
+const SKIP_LIVE = [
+  /\b(poem|poetry|story|song|lyrics|joke|riddle|essay|screenplay|fiction|brainstorm|imagine)\b/i,
+  /\b(write|draft|compose|create|generate|design|build|make)\s+(me\s+)?(a|an|my|the)?\s*(cv|résumé|resume|cover letter|letter|business plan|proposal|report|contract|agreement|document|memo|email|speech|bio|profile)\b/i,
+  /\b(translate|summari[sz]e|rephrase|reword|rewrite|proofread|edit|correct|fix)\b/i,
+  /\b(code|function|program|script|algorithm|regex|sql|html|css|javascript|python)\b/i,
+  /\b(how do i feel|should i|what should i|advice|motivat|inspire me|cheer me)\b/i,
 ]
 
 export function needsLiveSearch(query) {
   if (!query || typeof query !== 'string') return false
   const q = query.trim()
-  if (q.length < 3) return false
+  if (q.length < 4) return false
+  if (SKIP_LIVE.some((p) => p.test(q))) return false // timeless/creative → no search
   return LIVE_PATTERNS.some((p) => p.test(q))
 }
 
