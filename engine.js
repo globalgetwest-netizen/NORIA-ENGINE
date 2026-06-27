@@ -71,13 +71,15 @@ export async function ask(query, historyMessages = [], system = '') {
 
   let webResults = []
   let webContext = ''
-  if (needsLiveSearch(query)) {
-    try {
+  try {
+    if (needsLiveSearch(query)) {
       webResults = await webSearch(query)
       webContext = formatSearchContext(webResults)
-    } catch (e) {
-      console.warn('NORIA web search failed (continuing without):', e.message)
     }
+  } catch (e) {
+    console.warn('NORIA web search failed (continuing without):', e.message)
+    webResults = []
+    webContext = ''
   }
 
   const contextBlock = ragContext + webContext
@@ -160,13 +162,15 @@ export async function askStream(query, historyMessages = [], system = '', onToke
 
   let webResults = []
   let webContext = ''
-  if (needsLiveSearch(query)) {
-    try {
+  try {
+    if (needsLiveSearch(query)) {
       webResults = await webSearch(query)
       webContext = formatSearchContext(webResults)
-    } catch (e) {
-      console.warn('NORIA web search failed (continuing without):', e.message)
     }
+  } catch (e) {
+    console.warn('NORIA web search failed (continuing without):', e.message)
+    webResults = []
+    webContext = ''
   }
 
   const contextBlock = ragContext + webContext
