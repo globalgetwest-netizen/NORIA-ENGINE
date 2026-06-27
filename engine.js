@@ -12,6 +12,7 @@ import { complete, completeStream, activeProvider } from './llm.js'
 import { embed } from './embedder.js'
 import { similaritySearch } from './vectorstore.js'
 import { needsLiveSearch, webSearch, formatSearchContext } from './searcher.js'
+import { cacheGet, cacheSet } from './cache.js'
 
 // Minimal fallback only — the real, full system prompt is sent by the frontend
 // on every request and takes priority over this.
@@ -50,6 +51,18 @@ function temperatureFor(query) {
   return 0.2 // factual/general → precise, minimises hallucination
 }
 
+// Only cache GENERIC, repeatable answers — never personalised, conversational,
+// time-sensitive, or creative ones (those must be generated fresh each time).
+function isCacheable(query, historyMessages) {
+  if (historyMessages && historyMessages.length) return false // follow-up → depends on context
+  const q = (query || '').trim()
+  if (q.length < 4 || q.length > 300) return false
+  if (needsLiveSearch(q)) return false // current info must stay fresh
+  if (DOC_RE.test(q)) return false // documents are personalised
+  if (CREATIVE_RE.test(q)) return false // creative output should vary
+  return true
+}
+
 export async function ask(query, historyMessages = [], system = '') {
   const start = Date.now()
 
@@ -66,6 +79,16 @@ export async function ask(query, historyMessages = [], system = '') {
       retrievedDocs: 0,
       webResults: 0,
       provider: 'guardrail',
+    }
+  }
+
+  // Instant cache hit for generic, repeatable questions — no tokens, no wait.
+  const cacheable = isCacheable(query, historyMessages)
+  if (cacheable) {
+    const hit = cacheGet(query)
+    if (hit) {
+      console.log(JSON.stringify({ event: 'noria_query', query: query.slice(0, 100), provider: 'cache', ms: Date.now() - start }))
+      return { answer: hit.answer, sources: [], retrievedDocs: 0, webResults: 0, provider: 'cache' }
     }
   }
 
@@ -129,6 +152,9 @@ export async function ask(query, historyMessages = [], system = '') {
     ...webResults.map((r) => r.url).filter(Boolean),
   ].slice(0, 5)
 
+  // Save a successful, generic answer so the next person asking gets it instantly.
+  if (cacheable && !llmError && provider !== 'fallback' && answer) cacheSet(query, answer, provider)
+
   console.log(
     JSON.stringify({
       event: 'noria_query',
@@ -159,6 +185,17 @@ export async function askStream(query, historyMessages = [], system = '', onToke
       "That sits at the edge of what I can engage with directly — but I'm here for anything else you need: writing, analysis, documents, immigration, business, or any question at all."
     onToken(msg)
     return { answer: msg, sources: [], retrievedDocs: 0, webResults: 0, provider: 'guardrail' }
+  }
+
+  // Instant cache hit — emit the stored answer immediately and finish.
+  const cacheable = isCacheable(query, historyMessages)
+  if (cacheable) {
+    const hit = cacheGet(query)
+    if (hit) {
+      onToken(hit.answer)
+      console.log(JSON.stringify({ event: 'noria_query_stream', query: query.slice(0, 100), provider: 'cache', ms: Date.now() - start }))
+      return { answer: hit.answer, sources: [], retrievedDocs: 0, webResults: 0, provider: 'cache' }
+    }
   }
 
   let retrievedDocs = []
@@ -216,6 +253,8 @@ export async function askStream(query, historyMessages = [], system = '', onToke
     ...retrievedDocs.filter((d) => d.similarity > 0.5).map((d) => d.source),
     ...webResults.map((r) => r.url).filter(Boolean),
   ].slice(0, 5)
+
+  if (cacheable && !llmError && provider !== 'fallback' && answer) cacheSet(query, answer, provider)
 
   console.log(
     JSON.stringify({
