@@ -18,8 +18,15 @@
  * it is skipped and Noria simply answers from her own knowledge.
  */
 
-const FETCH_TIMEOUT_MS = 6000
+const FETCH_TIMEOUT_MS = 3500   // per request — keep the UI responsive
+const SEARCH_DEADLINE_MS = 5000 // hard cap on the WHOLE search so Noria never hangs
 const UA = 'NoriaBot/1.0 (+https://skyglobegroup.com)'
+
+// Resolve to `fallback` if `promise` doesn't settle within ms — guarantees the
+// search can never block the answer for longer than the deadline.
+function withDeadline(promise, ms, fallback) {
+  return Promise.race([promise, new Promise((res) => setTimeout(() => res(fallback), ms))])
+}
 
 async function fetchJSON(url, opts = {}) {
   const ctrl = new AbortController()
@@ -136,25 +143,28 @@ async function weatherLookup(query) {
 // ── Wikipedia (search → summaries) ───────────────────────────────────────────
 async function wikipediaLookup(query) {
   const search = await fetchJSON(
-    `https://en.wikipedia.org/w/api.php?action=query&list=search&srlimit=3&format=json&origin=*&srsearch=${encodeURIComponent(query)}`
+    `https://en.wikipedia.org/w/api.php?action=query&list=search&srlimit=2&format=json&origin=*&srsearch=${encodeURIComponent(query)}`
   )
   const hits = search?.query?.search || []
   if (!hits.length) return []
-  const rows = []
-  for (const h of hits.slice(0, 2)) {
-    const sum = await fetchJSON(
-      `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(h.title.replace(/ /g, '_'))}`
+  // Fetch the top summaries IN PARALLEL (was sequential → caused long hangs).
+  const sums = await Promise.all(
+    hits.slice(0, 2).map((h) =>
+      fetchJSON(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(h.title.replace(/ /g, '_'))}`)
+        .then((sum) =>
+          sum?.extract
+            ? {
+                kind: 'wikipedia',
+                title: sum.title || h.title,
+                snippet: sum.extract,
+                url: sum.content_urls?.desktop?.page || `https://en.wikipedia.org/wiki/${encodeURIComponent(h.title)}`,
+              }
+            : null
+        )
+        .catch(() => null)
     )
-    if (sum?.extract) {
-      rows.push({
-        kind: 'wikipedia',
-        title: sum.title || h.title,
-        snippet: sum.extract,
-        url: sum.content_urls?.desktop?.page || `https://en.wikipedia.org/wiki/${encodeURIComponent(h.title)}`,
-      })
-    }
-  }
-  return rows
+  )
+  return sums.filter(Boolean).slice(0, 1) // keep only the best to avoid noise
 }
 
 // ── DuckDuckGo Instant Answer ────────────────────────────────────────────────
@@ -175,14 +185,20 @@ async function duckduckgoLookup(query) {
 // ── Orchestrator ─────────────────────────────────────────────────────────────
 export async function webSearch(query) {
   if (!query) return []
-  // Run structured lookups (fast, exact) and general lookups in parallel.
-  const settled = await Promise.allSettled([
-    currencyLookup(query),
-    cryptoLookup(query),
-    weatherLookup(query),
-    wikipediaLookup(query),
-    duckduckgoLookup(query),
-  ])
+  // Run structured lookups (fast, exact) and general lookups in parallel, but
+  // never let the whole thing exceed the deadline — if it does, we return what
+  // we can and Noria answers from her own knowledge (no hanging on the user).
+  const settled = await withDeadline(
+    Promise.allSettled([
+      currencyLookup(query),
+      cryptoLookup(query),
+      weatherLookup(query),
+      wikipediaLookup(query),
+      duckduckgoLookup(query),
+    ]),
+    SEARCH_DEADLINE_MS,
+    []
+  )
 
   const results = []
   for (const s of settled) {
@@ -211,9 +227,10 @@ export function formatSearchContext(results) {
   const today = new Date().toISOString().slice(0, 10)
   const lines = results.map((r) => `• ${r.title}: ${r.snippet}`).join('\n')
   return (
-    '\n\n[LIVE INFORMATION retrieved just now — use it so your answer reflects the most current facts. ' +
-    'Weave it naturally into your answer as your own knowledge. Do NOT cite, footnote, or list these as sources]:\n' +
-    lines +
-    `\n(Live data retrieved ${today})`
+    '\n\n[LIVE REFERENCE retrieved just now (' + today + '). Use ONLY the items directly relevant to the question, ' +
+    'to make any current facts/figures accurate. IGNORE anything not relevant. For reasoning, analysis, and depth, ' +
+    'rely on your own expert knowledge — do not let these snippets narrow your answer. Never cite, footnote, or list ' +
+    'them as sources]:\n' +
+    lines
   )
 }
