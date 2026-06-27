@@ -217,15 +217,27 @@ app.post('/v1/ask/stream', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-transform')
   res.setHeader('Connection', 'keep-alive')
   res.setHeader('X-Accel-Buffering', 'no') // disable proxy buffering so tokens flush
+  res.setHeader('Content-Encoding', 'identity') // never gzip — compression buffers SSE
   if (res.flushHeaders) res.flushHeaders()
 
-  const send = (obj) => { res.write(`data: ${JSON.stringify(obj)}\n\n`) }
+  const send = (obj) => {
+    res.write(`data: ${JSON.stringify(obj)}\n\n`)
+    if (typeof res.flush === 'function') res.flush() // push bytes out immediately
+  }
+
+  // Prime the connection right away + a heartbeat so proxies don't buffer and
+  // the client's first-token watchdog sees activity immediately.
+  res.write(': open\n\n')
+  if (typeof res.flush === 'function') res.flush()
+  const heartbeat = setInterval(() => { try { res.write(': hb\n\n'); if (res.flush) res.flush() } catch (_) {} }, 15000)
 
   try {
     const result = await askStream(query, history, system, (token) => send({ token }))
     send({ done: true, sources: result.sources || [], provider: result.provider })
+    clearInterval(heartbeat)
     res.end()
   } catch (e) {
+    clearInterval(heartbeat)
     console.error('/v1/ask/stream error:', e)
     send({ error: true, answer: 'Noria is momentarily unavailable. Please try again in a few seconds.' })
     res.end()
