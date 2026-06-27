@@ -38,7 +38,10 @@ function detectInjection(query) {
 // get a modest budget, which lets far more requests through per minute.
 const DOC_RE = /\b(cv|résumé|resume|cover letter|business plan|proposal|report|contract|agreement|essay|letter|document|memo|policy|plan|blueprint|full|detailed|comprehensive|in[\s-]?depth|step[\s-]?by[\s-]?step|complete)\b/i
 function outputBudget(query) {
-  return DOC_RE.test(query || '') ? 3000 : 1024
+  // Higher budgets prevent answers being cut off mid-thought ("skipping").
+  // Documents get the most; normal answers get a comfortable 2048 so they
+  // finish completely while staying within providers' per-minute token limits.
+  return DOC_RE.test(query || '') ? 4000 : 2048
 }
 
 // Adaptive temperature for accuracy. Factual questions get a LOW temperature so
