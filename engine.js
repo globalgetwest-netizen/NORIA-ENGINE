@@ -126,8 +126,9 @@ function isCacheable(query, historyMessages) {
   return true
 }
 
-export async function ask(query, historyMessages = [], system = '') {
+export async function ask(query, historyMessages = [], system = '', opts = {}) {
   const start = Date.now()
+  const premium = opts.tier === 'premium'
 
   // The system prompt sent by the caller (frontend) is authoritative.
   // Fall back to the minimal built-in only if none was provided.
@@ -205,7 +206,7 @@ export async function ask(query, historyMessages = [], system = '') {
   let provider = activeProvider()
   let llmError = null
   try {
-    answer = await complete(messages, { maxTokens: outputBudget(query), temperature: temperatureFor(query) })
+    answer = await complete(messages, { maxTokens: outputBudget(query), temperature: temperatureFor(query), premium })
   } catch (e) {
     console.error('NORIA LLM error:', e.message)
     llmError = e.message
@@ -241,8 +242,9 @@ export async function ask(query, historyMessages = [], system = '') {
  * then streams the LLM answer token-by-token through onToken(delta).
  * Resolves to the same shape as ask() once the stream completes.
  */
-export async function askStream(query, historyMessages = [], system = '', onToken = () => {}) {
+export async function askStream(query, historyMessages = [], system = '', onToken = () => {}, opts = {}) {
   const start = Date.now()
+  const premium = opts.tier === 'premium'
 
   const systemPrompt =
     typeof system === 'string' && system.trim().length > 0 ? system : buildSkyglobeSystem()
@@ -312,7 +314,7 @@ export async function askStream(query, historyMessages = [], system = '', onToke
   let provider = activeProvider()
   let llmError = null
   try {
-    answer = await completeStream(messages, { maxTokens: outputBudget(query), temperature: temperatureFor(query) }, onToken)
+    answer = await completeStream(messages, { maxTokens: outputBudget(query), temperature: temperatureFor(query), premium }, onToken)
   } catch (e) {
     console.error('NORIA LLM stream error:', e.message)
     llmError = e.message

@@ -19,6 +19,8 @@ import { ingestText } from './ingest.js'
 import { setupSchema } from './vectorstore.js'
 import { seedKnowledge } from './ingest.js'
 import { activeProvider } from './llm.js'
+import { authRouter, setupAuthSchema, attachUser } from './auth.js'
+import { billingRouter, handleWebhook, requireActiveSubscription, getEntitlement, paywallEnabled, billingConfigured } from './billing.js'
 
 // ── Crash guards — the engine is the core; it must NEVER die from a stray error.
 // A single unhandled promise rejection or background exception would otherwise
@@ -32,7 +34,9 @@ process.on('uncaughtException', (err) => {
 })
 
 const app = express()
-app.use(express.json({ limit: '1mb' }))
+// Capture the raw request body so the Paystack webhook can verify its signature
+// (HMAC is computed over the exact bytes Paystack sent, not the re-serialized JSON).
+app.use(express.json({ limit: '1mb', verify: (req, _res, buf) => { req.rawBody = buf } }))
 
 // CORS — restrict to your SkyGlobe domains in production via ALLOWED_ORIGINS
 const allowed = (process.env.ALLOWED_ORIGINS || '*').split(',').map((s) => s.trim())
@@ -51,7 +55,7 @@ app.use(
 const hits = new Map()
 const WINDOW_MS = 60_000
 const MAX_PER_WINDOW = Number(process.env.RATE_LIMIT_PER_MIN) || 200
-const RATE_EXEMPT = new Set(['/health', '/v1/test-llm', '/v1/test-cerebras', '/v1/feedback', '/v1/cache-stats', '/v1/test-search'])
+const RATE_EXEMPT = new Set(['/health', '/v1/test-llm', '/v1/test-cerebras', '/v1/feedback', '/v1/cache-stats', '/v1/test-search', '/v1/billing/webhook'])
 app.use((req, res, next) => {
   if (RATE_EXEMPT.has(req.path)) return next()
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown'
@@ -66,6 +70,15 @@ app.use((req, res, next) => {
   if (rec.count > MAX_PER_WINDOW) return res.status(429).json({ error: 'Too many requests. Please slow down.' })
   next()
 })
+
+// ── Accounts & billing ────────────────────────────────────────────────────────
+// Paystack webhook FIRST — it needs the raw body (captured above) and must never
+// be behind auth. Then attach the signed-in user to every request, and mount the
+// auth + billing routers.
+app.post('/v1/billing/webhook', handleWebhook)
+app.use(attachUser)
+app.use('/v1/auth', authRouter())
+app.use('/v1/billing', billingRouter())
 
 function requireSecret(req, res) {
   const secret = process.env.NORIA_SETUP_SECRET
@@ -210,6 +223,8 @@ app.get('/health', (req, res) => {
     service: 'noria-engine',
     provider: activeProvider(),
     db: !!process.env.DATABASE_URL,
+    paywallEnabled: paywallEnabled(),
+    billingConfigured: billingConfigured(),
     // Safe diagnostics — booleans only, NEVER the actual key values
     env: {
       GEMINI_API_KEY: !!process.env.GEMINI_API_KEY,
@@ -277,7 +292,7 @@ app.get('/img/:id', (req, res) => {
 })
 
 // ── Main query endpoint ─────────────────────────────────────────────────────
-app.post('/v1/ask', async (req, res) => {
+app.post('/v1/ask', requireActiveSubscription(), async (req, res) => {
   try {
     const query = String(req.body?.query ?? req.body?.message ?? '').trim()
     if (!query) return res.status(400).json({ error: 'query is required' })
@@ -292,7 +307,8 @@ app.post('/v1/ask', async (req, res) => {
     // identity, language law, and writing rules actually reach the model.
     const system = typeof req.body?.system === 'string' ? req.body.system : ''
 
-    const result = await ask(query, history, system)
+    const ent = req.entitlement || (await getEntitlement(req.user))
+    const result = await ask(query, history, system, { tier: ent.tier })
     res.json(result)
   } catch (e) {
     console.error('/v1/ask error:', e)
@@ -307,7 +323,7 @@ app.post('/v1/ask', async (req, res) => {
 // ── Streaming query (Server-Sent Events) ─────────────────────────────────────
 // Emits: {token:"..."} per chunk, then a final {done:true, sources, provider}.
 // On failure: {error:true, answer:"..."}. The frontend renders tokens live.
-app.post('/v1/ask/stream', async (req, res) => {
+app.post('/v1/ask/stream', requireActiveSubscription(), async (req, res) => {
   const query = String(req.body?.query ?? req.body?.message ?? '').trim()
   if (!query) return res.status(400).json({ error: 'query is required' })
   if (query.length > 2000) return res.status(400).json({ error: 'query too long (max 2000 chars)' })
@@ -317,6 +333,7 @@ app.post('/v1/ask/stream', async (req, res) => {
     .filter((m) => m.role === 'user' || m.role === 'assistant')
     .map((m) => ({ role: m.role, content: String(m.content) }))
   const system = typeof req.body?.system === 'string' ? req.body.system : ''
+  const ent = req.entitlement || (await getEntitlement(req.user))
 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
   res.setHeader('Cache-Control', 'no-cache, no-transform')
@@ -348,7 +365,7 @@ app.post('/v1/ask/stream', async (req, res) => {
   }, 15000)
 
   try {
-    const result = await askStream(query, history, system, (token) => send({ token }))
+    const result = await askStream(query, history, system, (token) => send({ token }), { tier: ent.tier })
     send({ done: true, sources: result.sources || [], provider: result.provider })
   } catch (e) {
     console.error('/v1/ask/stream error:', e)
@@ -381,8 +398,9 @@ app.post('/v1/setup', async (req, res) => {
   if (!process.env.DATABASE_URL) return res.status(503).json({ error: 'DATABASE_URL not configured' })
   try {
     await setupSchema()
+    await setupAuthSchema()
     await seedKnowledge()
-    res.json({ ok: true, message: 'NORIA schema created and seed knowledge ingested.' })
+    res.json({ ok: true, message: 'NORIA schema created (knowledge + accounts + subscriptions) and seed knowledge ingested.' })
   } catch (e) {
     console.error('/v1/setup error:', e)
     res.status(500).json({ error: e.message })
@@ -399,8 +417,9 @@ app.get('/v1/setup', async (req, res) => {
   if (!process.env.DATABASE_URL) return res.status(503).send('DATABASE_URL not configured')
   try {
     await setupSchema()
+    await setupAuthSchema()
     await seedKnowledge()
-    res.send('✅ NORIA setup complete — schema created and all knowledge (Africa + SkyGlobe) ingested into the database. You can close this tab.')
+    res.send('✅ NORIA setup complete — knowledge, accounts, and subscription tables created; all knowledge (Africa + SkyGlobe) ingested. You can close this tab.')
   } catch (e) {
     console.error('/v1/setup (GET) error:', e)
     res.status(500).send('Setup failed: ' + e.message)

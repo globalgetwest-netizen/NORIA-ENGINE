@@ -41,6 +41,19 @@ const GROQ_KEYS = parseKeys('GROQ_API_KEYS', 'GROQ_API_KEY')
 const CEREBRAS_KEYS = parseKeys('CEREBRAS_API_KEYS', 'CEREBRAS_API_KEY')
 const OPENROUTER_KEYS = parseKeys('OPENROUTER_API_KEYS', 'OPENROUTER_API_KEY')
 
+// ── Premium tier (paid subscribers) ─────────────────────────────────────────────
+// A single, best-in-class model used ONLY when opts.premium is set (Premium plan).
+// OpenAI-compatible, so PREMIUM_BASE_URL can point at OpenRouter (access to GPT /
+// Claude / Gemini Pro with one key), OpenAI, Groq, Together, etc. All env-driven so
+// a future model rename is a dashboard change, never a code change.
+const PREMIUM_KEY = process.env.PREMIUM_API_KEY || ''
+const PREMIUM_URL = process.env.PREMIUM_BASE_URL || 'https://openrouter.ai/api/v1/chat/completions'
+const PREMIUM_MODELS = [process.env.PREMIUM_MODEL || 'openai/gpt-4o-mini', process.env.PREMIUM_FALLBACK_MODEL || ''].filter(Boolean)
+const PREMIUM_HEADERS = /openrouter/.test(PREMIUM_URL)
+  ? { 'HTTP-Referer': process.env.OPENROUTER_REFERER || 'https://noria-engine.onrender.com', 'X-Title': process.env.OPENROUTER_TITLE || 'Noria' }
+  : {}
+export const premiumConfigured = () => !!PREMIUM_KEY
+
 // Round-robin cursor so load spreads across keys instead of always hammering #1.
 let rotation = 0
 function rotate(arr) {
@@ -254,6 +267,10 @@ async function openAICompatibleStream({ url, key, models, messages, opts, extraH
 
 export async function completeStream(messages, opts = {}, onToken = () => {}) {
   const all = []
+  // Premium subscribers → try the premium model first, then fall through to the
+  // free chain if it errors (so a premium user is never left without an answer).
+  if (opts.premium && PREMIUM_KEY)
+    all.push({ id: 'premium', name: 'premium', fn: () => openAICompatibleStream({ url: PREMIUM_URL, key: PREMIUM_KEY, models: PREMIUM_MODELS, messages, opts, extraHeaders: PREMIUM_HEADERS }, onToken) })
   for (const key of rotate(GROQ_KEYS))
     all.push({ id: `groq:${key}`, name: `groq#${GROQ_KEYS.indexOf(key) + 1}`, fn: () => openAICompatibleStream({ url: 'https://api.groq.com/openai/v1/chat/completions', key, models: [process.env.GROQ_MODEL || 'openai/gpt-oss-120b', process.env.GROQ_FALLBACK_MODEL || 'openai/gpt-oss-20b'], messages, opts }, onToken) })
   for (const key of rotate(CEREBRAS_KEYS))
@@ -288,6 +305,9 @@ export async function complete(messages, opts = {}) {
   // then every OpenRouter key, then optional Gemini, then optional Ollama.
   // Keys are rotated for load spread.
   const all = []
+  // Premium subscribers → best model first, free chain as automatic fallback.
+  if (opts.premium && PREMIUM_KEY)
+    all.push({ id: 'premium', name: 'premium', fn: () => openAICompatible({ url: PREMIUM_URL, key: PREMIUM_KEY, models: PREMIUM_MODELS, messages, opts, extraHeaders: PREMIUM_HEADERS }) })
   for (const key of rotate(GROQ_KEYS))
     all.push({ id: `groq:${key}`, name: `groq#${GROQ_KEYS.indexOf(key) + 1}`, fn: () => groqComplete(key, messages, opts) })
   for (const key of rotate(CEREBRAS_KEYS))

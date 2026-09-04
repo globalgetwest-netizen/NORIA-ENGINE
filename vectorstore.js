@@ -3,22 +3,8 @@
  * Uses DATABASE_URL. No extra vendor, no subscription.
  */
 
-import pg from 'pg'
+import { getPool } from './db.js'
 import { EMBEDDING_DIM } from './embedder.js'
-
-const { Pool } = pg
-let _pool = null
-
-function getPool() {
-  if (_pool) return _pool
-  _pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: /render\.com|amazonaws\.com|supabase/.test(process.env.DATABASE_URL || '')
-      ? { rejectUnauthorized: false }
-      : false,
-  })
-  return _pool
-}
 
 export async function setupSchema() {
   const pool = getPool()
