@@ -216,6 +216,29 @@ app.get('/v1/cache-stats', async (req, res) => {
   }
 })
 
+// ── TEMP DB diagnostic (remove after debugging) ───────────────────────────────
+app.get('/v1/test-db', async (req, res) => {
+  const out = { databaseUrlSet: !!process.env.DATABASE_URL }
+  try {
+    const { getPool } = await import('./db.js')
+    const pool = getPool()
+    const r = await pool.query('SELECT 1 AS ok')
+    out.connect = { ok: true, result: r.rows[0] }
+    try {
+      const { setupAuthSchema } = await import('./auth.js')
+      await setupAuthSchema()
+      out.authSchema = { ok: true }
+      const t = await pool.query(`SELECT count(*)::int AS n FROM noria_users`)
+      out.usersTable = { ok: true, count: t.rows[0].n }
+    } catch (e) {
+      out.authSchema = { ok: false, error: e.message }
+    }
+  } catch (e) {
+    out.connect = { ok: false, error: e.message, code: e.code }
+  }
+  res.json(out)
+})
+
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({
