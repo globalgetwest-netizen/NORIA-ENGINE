@@ -2,11 +2,17 @@
  * NORIA LLM Layer — model abstraction with multi-key rotation.
  *
  * Provider chain (all free tier):
- *   1. Groq       (llama-3.3-70b-versatile → llama-3.1-8b-instant fallback)
- *   2. Cerebras   (llama-3.3-70b → llama3.1-8b fallback) — 1M tokens/day free
+ *   1. Groq       (openai/gpt-oss-120b → openai/gpt-oss-20b fallback)
+ *   2. Cerebras   (gpt-oss-120b → zai-glm-4.7 fallback) — 1M tokens/day free
  *   3. OpenRouter (llama-3.3-70b-instruct:free → fallback free model)
- *   4. Gemini     (only if GEMINI_ENABLED=true — most free projects have quota 0)
+ *   4. Gemini     (gemini-3.5-flash-lite — on by default when a key exists)
  *   5. Ollama     (local, 100% free)
+ *
+ * NOTE (2026-09): Groq shut down llama-3.3-70b-versatile / llama-3.1-8b-instant
+ * for free & dev tiers (Aug 2026), and Google shut down gemini-2.0-flash-lite
+ * (Jun 2026). Defaults below track the providers' recommended replacements.
+ * Every model is env-overridable (GROQ_MODEL, GEMINI_MODEL, …) so future
+ * deprecations can be handled without a code change.
  *
  * MULTI-KEY ROTATION
  * ──────────────────
@@ -113,8 +119,8 @@ async function openAICompatible({ url, key, models, messages, opts, extraHeaders
 
 async function groqComplete(key, messages, opts = {}) {
   const models = [
-    process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
-    process.env.GROQ_FALLBACK_MODEL || 'llama-3.1-8b-instant',
+    process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
+    process.env.GROQ_FALLBACK_MODEL || 'openai/gpt-oss-20b',
   ]
   return openAICompatible({ url: 'https://api.groq.com/openai/v1/chat/completions', key, models, messages, opts })
 }
@@ -154,7 +160,7 @@ async function geminiComplete(messages, opts = {}) {
   const contents = messages
     .filter((m) => m.role !== 'system')
     .map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }))
-  const model = process.env.GEMINI_MODEL || 'gemini-2.0-flash-lite'
+  const model = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite'
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
     {
@@ -249,7 +255,7 @@ async function openAICompatibleStream({ url, key, models, messages, opts, extraH
 export async function completeStream(messages, opts = {}, onToken = () => {}) {
   const all = []
   for (const key of rotate(GROQ_KEYS))
-    all.push({ id: `groq:${key}`, name: `groq#${GROQ_KEYS.indexOf(key) + 1}`, fn: () => openAICompatibleStream({ url: 'https://api.groq.com/openai/v1/chat/completions', key, models: [process.env.GROQ_MODEL || 'llama-3.3-70b-versatile', process.env.GROQ_FALLBACK_MODEL || 'llama-3.1-8b-instant'], messages, opts }, onToken) })
+    all.push({ id: `groq:${key}`, name: `groq#${GROQ_KEYS.indexOf(key) + 1}`, fn: () => openAICompatibleStream({ url: 'https://api.groq.com/openai/v1/chat/completions', key, models: [process.env.GROQ_MODEL || 'openai/gpt-oss-120b', process.env.GROQ_FALLBACK_MODEL || 'openai/gpt-oss-20b'], messages, opts }, onToken) })
   for (const key of rotate(CEREBRAS_KEYS))
     all.push({ id: `cerebras:${key}`, name: `cerebras#${CEREBRAS_KEYS.indexOf(key) + 1}`, fn: () => openAICompatibleStream({ url: 'https://api.cerebras.ai/v1/chat/completions', key, models: [process.env.CEREBRAS_MODEL || 'gpt-oss-120b', process.env.CEREBRAS_FALLBACK_MODEL || 'zai-glm-4.7'], messages, opts }, onToken) })
   for (const key of rotate(OPENROUTER_KEYS))

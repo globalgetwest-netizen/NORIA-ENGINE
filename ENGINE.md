@@ -40,9 +40,9 @@ User → frontend → POST /v1/ask  or  /v1/ask/stream
 **LLM order:** every Groq key → every Cerebras key → every OpenRouter key →
 Gemini → Ollama. A key that hits a daily limit or has no model access is
 **parked on cooldown** and skipped; the next key/provider takes over. Models:
-- Groq: `llama-3.3-70b-versatile` → `llama-3.1-8b-instant`
+- Groq: `openai/gpt-oss-120b` → `openai/gpt-oss-20b`
 - Cerebras: `gpt-oss-120b` → `zai-glm-4.7`
-- Gemini: `gemini-2.0-flash-lite` (on by default when a key exists)
+- Gemini: `gemini-3.5-flash-lite` (on by default when a key exists)
 
 **Search order (free longevity):** Tavily → Google CSE → DuckDuckGo (keyless,
 unlimited) → Serper (one-time credit, kept as reserve).
