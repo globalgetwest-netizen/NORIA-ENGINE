@@ -442,4 +442,11 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
   console.log(`NORIA engine listening on :${PORT} — provider=${activeProvider()} db=${!!process.env.DATABASE_URL}`)
+  // Ensure the accounts + subscription tables exist (idempotent). This means a
+  // fresh deploy is ready for sign-ups without manually running /v1/setup.
+  if (process.env.DATABASE_URL) {
+    setupAuthSchema()
+      .then(() => console.log('NORIA auth/subscription schema ready'))
+      .catch((e) => console.error('auth schema init failed (accounts may not work until /v1/setup is run):', e.message))
+  }
 })
