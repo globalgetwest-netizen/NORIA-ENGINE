@@ -216,25 +216,28 @@ app.get('/v1/cache-stats', async (req, res) => {
   }
 })
 
-// ── TEMP DB diagnostic (remove after debugging) ───────────────────────────────
+// ── DB connectivity diagnostic (secret-guarded) ───────────────────────────────
+// Open: /v1/test-db?secret=YOUR_NORIA_SETUP_SECRET → confirms the database is
+// reachable and the accounts table exists (never exposes any data).
 app.get('/v1/test-db', async (req, res) => {
+  const secret = process.env.NORIA_SETUP_SECRET
+  if (secret && req.query.secret !== secret) return res.status(401).send('Unauthorized — add ?secret=YOUR_NORIA_SETUP_SECRET')
   const out = { databaseUrlSet: !!process.env.DATABASE_URL }
   try {
     const { getPool } = await import('./db.js')
     const pool = getPool()
-    const r = await pool.query('SELECT 1 AS ok')
-    out.connect = { ok: true, result: r.rows[0] }
+    await pool.query('SELECT 1')
+    out.connect = { ok: true }
     try {
       const { setupAuthSchema } = await import('./auth.js')
       await setupAuthSchema()
-      out.authSchema = { ok: true }
       const t = await pool.query(`SELECT count(*)::int AS n FROM noria_users`)
-      out.usersTable = { ok: true, count: t.rows[0].n }
+      out.accounts = { ok: true, users: t.rows[0].n }
     } catch (e) {
-      out.authSchema = { ok: false, error: e.message }
+      out.accounts = { ok: false, error: e.message }
     }
   } catch (e) {
-    out.connect = { ok: false, error: e.message, code: e.code }
+    out.connect = { ok: false, error: e.message, code: e.code, hint: 'ENOTFOUND = the database host no longer exists. Provision a new Postgres and update DATABASE_URL.' }
   }
   res.json(out)
 })
